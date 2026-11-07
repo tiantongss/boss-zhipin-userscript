@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.4.1
+// @version      3.4.2
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.4.1 (采集模式+图形化导出路径)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.4.2 (采集模式+图形化导出路径)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -728,7 +728,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.4.1(采集模式)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.4.2(采集模式)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -2029,7 +2029,7 @@
       readCfg(); // 保存到配置
       log('导出路径已设为:' + $('bag-exportpath').value);
     } else {
-      log(r ? '已取消选择' : '本地服务离线,无法打开选择框');
+      log(r ? ('未选择目录' + (r.err ? ':' + r.err : '')) : '本地服务离线,无法打开选择框');
     }
   };
   $('bag-exportjobs').onclick = async () => {
