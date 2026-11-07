@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.3
+// @version      1.2.4
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -36,7 +36,7 @@
     ta.remove();
   };
 
-  console.log('[%s] 脚本已加载 v1.2.3 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.2.4 (安全增强版)', 'BOSS海投助手');
 
   /* ===================== 配置 ===================== */
   const DEFAULTS = {
@@ -227,13 +227,22 @@
     return null;
   }
 
-  // 寻找「留在此页」按钮
+  // 寻找「留在此页 / 留在此界面」按钮（常见于"已向BOSS发送消息"提示弹窗）
+  const STAY_TEXT = /^留在此(页面?|界面)?$/;
+
+  function isShown(el) {
+    return !!(el && el.getClientRects && el.getClientRects().length > 0);
+  }
+
   function findStayBtn() {
-    const els = document.querySelectorAll('a,button,span,div,p,li');
+    const norm = (s) => (s || '').replace(/\s+/g, '');
+    const els = document.querySelectorAll('a,button,span,div,p,li,em,i,strong');
     for (const el of els) {
-      if (el.offsetParent === null) continue;
-      if (/^\s*留在此(?:页面?|界面?)\s*$/.test(el.textContent)) {
-        const inner = [...el.querySelectorAll('*')].find((c) => /^\s*留在此(?:页面?|界面?)\s*$/.test(c.textContent));
+      if (!isShown(el)) continue;
+      const t = norm(el.textContent);
+      if (!t || t.length > 12) continue; // 按钮文案很短，避免命中整块容器
+      if (STAY_TEXT.test(t)) {
+        const inner = [...el.querySelectorAll('*')].find((c) => isShown(c) && STAY_TEXT.test(norm(c.textContent)));
         return inner || el;
       }
     }
