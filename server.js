@@ -75,15 +75,17 @@ http.createServer(async (req, res) => {
     // 图形化目录选择(用户交互,超时放宽到 130s)
     const ps = spawn('powershell.exe', ['-STA', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', pickdirPs1]);
     let out = '';
+    let err = '';
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
       const dir = out.trim().split(/\r?\n/).pop() || '';
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ ok: !!dir, path: dir }));
+      res.end(JSON.stringify({ ok: !!dir, path: dir, err: err.trim().slice(0, 300) || undefined }));
     };
     ps.stdout.on('data', (d) => { out += d; });
+    ps.stderr.on('data', (d) => { err += d; });
     ps.on('close', finish);
     ps.on('error', finish);
     setTimeout(() => { try { ps.kill(); } catch (e) {} finish(); }, 130000);
