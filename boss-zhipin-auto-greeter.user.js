@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.5
-// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位
+// @version      1.2.6
+// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
@@ -36,7 +36,7 @@
     ta.remove();
   };
 
-  console.log('[%s] 脚本已加载 v1.2.5 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.2.6 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -291,20 +291,49 @@
     );
   }
 
+  function anyDialog() {
+    return [...document.querySelectorAll(SEL.dialog)].find(isShown) || null;
+  }
+
+  async function waitDialogGone(timeout) {
+    return await waitFor(() => !anyDialog(), timeout, 120);
+  }
+
+  // 点「留在此页」关掉弹窗；true=已清空，false=关不掉
   async function closeDialog() {
-    const btn = await waitFor(findStayBtn, 2000, 100);
-    if (btn) {
-      clickStay(btn);
-      log('已点击"留在此页"');
-      await sleep(500);
-      return;
+    for (let i = 0; i < 3; i++) {
+      const btn = await waitFor(findStayBtn, 2500, 100);
+      if (btn) {
+        clickStay(btn);
+        log('已点击"留在此页"');
+        await sleep(rand(400, 700));
+        if (await waitDialogGone(1500)) return true;
+        continue;
+      }
+      const close = document.querySelector(`${SEL.dialog} .close, ${SEL.dialog} .icon-close, ${SEL.dialog} .cancel-btn`);
+      if (close) {
+        close.click();
+        log('未找到"留在此页",已点关闭按钮');
+        await sleep(rand(400, 700));
+        if (await waitDialogGone(1200)) return true;
+        continue;
+      }
+      const r = detectRisk();
+      if (r) { trip(r); return false; }
+      break;
     }
-    const close = document.querySelector(`${SEL.dialog} .close, ${SEL.dialog} .icon-close, ${SEL.dialog} .cancel-btn`);
-    if (close) {
-      close.click();
-      log('未找到"留在此页",已点关闭按钮');
-      await sleep(500);
-    }
+    // 兜底：Esc 关闭遮罩
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+    await sleep(500);
+    if (await waitDialogGone(1200)) return true;
+    log('⚠ 弹窗无法关闭，为避免误点已终止');
+    return false;
+  }
+
+  // 进入下一个岗位前清场：有弹窗就关，没有直接返回
+  async function ensureClear() {
+    if (!anyDialog()) return true;
+    return await closeDialog();
   }
 
   /* ===== 发送简历附件 ===== */
@@ -412,7 +441,8 @@
     }
 
     btn.click();
-    await sleep(rand(900, 1500));
+    // 等「留在此页」弹窗出现（最多 4 秒），出现后立即处理
+    await waitFor(anyDialog, 4000, 120);
 
     // 投递后再次严格检测是否触发风控限制
     const riskAfter = detectRisk();
@@ -421,7 +451,7 @@
       return 'halt';
     }
 
-    await closeDialog();
+    if (!(await closeDialog())) return 'halt';
     await sleep(rand(600, 1000));
     const resumeSent = await sendResumeAttachment();
     sent++;
@@ -493,6 +523,9 @@
         if (!running || sent >= cfg.max) break;
         seen.add(card);
         _gmSet('bag_hb', Date.now());
+
+        // 进入下一个岗位前先清场，避免弹窗遮罩导致误点
+        if (!(await ensureClear())) break;
 
         let st = 'skip';
         try {
