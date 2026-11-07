@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      2.2.0
+// @version      2.3.0
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）；按关键词队列依次搜索，列表滚动到底自动切换下一个关键词，异常时由 AI 从有限动作集中选择处置动作
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -60,7 +60,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v2.2.0 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v2.3.0 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -498,59 +498,99 @@
   }
 
   /* ============ AI 按钮定位 ============ */
-  let _aiBtnCache = {}; // key: 按钮类型+页面指纹 → {elIdx, ts}
-  let _aiBtnAt = 0;      // 限频
-  const AI_BTN_COOLDOWN = 5000;
+  // 通用「AI 找按钮」引擎：常规选择器找不到时，把页面可见按钮提取成候选清单
+  // 交给 AI 选序号，按序号直接操作真实 DOM 元素（AI 不生成选择器，杜绝瞎编）
+  const AI_BTN_SELECTOR = 'a,button,div[role="button"],span[role="button"],input[type="button"],input[type="submit"],.btn,.op-btn,[class*="btn"],[class*="button"],[class*="chat"],[class*="send"],[class*="resume"]';
+  const AI_BTN_MAX = 40;        // 候选上限，控制 token
+  const AI_BTN_COOLDOWN = 4000; // 两次 AI 定位之间的最小间隔（单并发保护）
 
-  // 从页面提取可见按钮/链接的候选列表（给 AI 看的）
+  let _aiBtnCache = {}; // key: 按钮类型+页面指纹 → {el, ts}
+  let _aiBtnAt = 0;     // 限频时间戳
+
+  // 各类按钮的识别提示词：告诉 AI 按什么特征挑
+  const AI_BTN_HINTS = {
+    chat: {
+      label: '立即沟通',
+      hint: '高亮/主色按钮，class常含 chat/op-btn/startchat，文字含"沟通"，通常 inDetail=true（右侧详情面板顶部）；排除"继续沟通"以外的非沟通按钮',
+      keyword: '沟通',
+    },
+    stay: {
+      label: '留在此页',
+      hint: '出现在投递成功弹窗中，inDialog=true，文字含"留在此"；若文字被图标截断，可选弹窗内文字含"留"的小按钮',
+      keyword: '留在此',
+    },
+    resume: {
+      label: '发送简历',
+      hint: '在聊天窗口工具区，文字含"简历"（如 发简历/发送简历/附件简历）；不是"求简历"也不是简历文件链接',
+      keyword: '简历',
+    },
+    confirm: {
+      label: '发送/确定',
+      hint: '出现在简历发送确认弹窗中，inDialog=true，文字是 发送/确定/确认发送，是主按钮（通常高亮）',
+      keyword: '',
+    },
+    close: {
+      label: '关闭弹窗',
+      hint: '弹窗右上角关闭按钮，inDialog=true，class常含 close/icon-close，文字可能是 × 或为空',
+      keyword: '',
+    },
+  };
+
+  // 提取页面可见按钮候选；每个候选自带 el 引用（不随 JSON 发给 AI，避免循环引用）
   function extractBtnCandidates() {
-    const els = [...document.querySelectorAll('a,button,div[role="button"],span[role="button"],input[type="button"],input[type="submit"],.btn,.op-btn,[class*="btn"],[class*="button"],[class*="chat"],[class*="send"]')]
-      .filter((el) => isShown(el) && (el.textContent || '').trim().length > 0 && (el.textContent || '').trim().length <= 20)
-      .slice(0, 40); // 只取前40个，避免太多
-    return els.map((el, i) => {
-      const r = el.getBoundingClientRect();
-      const cls = String(el.className || '').trim().slice(0, 60);
-      const txt = (el.textContent || '').replace(/\s+/g, '').slice(0, 20);
-      const role = el.getAttribute('role') || el.tagName.toLowerCase();
-      return {
-        idx: i,
-        tag: el.tagName.toLowerCase(),
-        class: cls,
-        text: txt,
-        role: role,
-        x: Math.round(r.left), y: Math.round(r.top),
-        w: Math.round(r.width), h: Math.round(r.height),
-        inDialog: !!el.closest(SEL.dialog),
-        inDetail: !!el.closest(SEL.detailBox),
-        inCard: !!el.closest(SEL.card),
-      };
-    });
+    const els = [...document.querySelectorAll(AI_BTN_SELECTOR)]
+      .filter((el) => isShown(el))
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          el,
+          tag: el.tagName.toLowerCase(),
+          class: String(el.className || '').trim().slice(0, 60),
+          text: (el.textContent || '').replace(/\s+/g, '').slice(0, 20),
+          role: el.getAttribute('role') || '',
+          x: Math.round(r.left), y: Math.round(r.top),
+          w: Math.round(r.width), h: Math.round(r.height),
+          inDialog: !!el.closest(SEL.dialog),
+          inDetail: !!el.closest(SEL.detailBox),
+          inCard: !!el.closest(SEL.card),
+        };
+      })
+      .filter((c) => c.text || /close|btn/.test(c.class)) // 保留有文字的 + 明显的按钮
+      .slice(0, AI_BTN_MAX);
+    els.forEach((c, i) => { c.idx = i; });
+    return els;
   }
 
-  // AI 判断哪个候选是目标按钮，返回元素序号
-  async function aiFindBtn(btnType, candidates) {
-    if (!cfg.aiEnabled) return null;
+  // 把候选转成发给 AI 的纯文本（剥离 el，防止 JSON 循环引用）
+  function candidatesToJson(candidates) {
+    return JSON.stringify(
+      candidates.map(({ el, ...rest }) => rest),
+      null, 1
+    );
+  }
+
+  // 让 AI 从候选中挑一个；返回 {cand, reason} 或 null
+  async function aiPickBtn(type, candidates) {
+    const hint = AI_BTN_HINTS[type];
+    if (!hint || !cfg.aiEnabled) return null;
     const key = _gmGet('aiKey', '');
     if (!key) return null;
     if (Date.now() - _aiBtnAt < AI_BTN_COOLDOWN) return null;
     _aiBtnAt = Date.now();
 
     const prompt = [
-      `你是网页UI元素识别助手。任务：在BOSS直聘页面中，从给定的候选元素列表中，找出「${btnType}」按钮。`,
+      `你是网页UI元素识别助手。BOSS直聘页面，从候选元素列表中找出「${hint.label}」按钮。`,
+      '',
+      '【识别特征】' + hint.hint,
       '',
       '【候选元素】',
-      JSON.stringify(candidates, null, 1),
+      candidatesToJson(candidates),
       '',
-      '【判断依据】',
-      '- 「立即沟通」通常是高亮按钮（背景色鲜艳、有chat/op-btn类名），在详情面板内，文字含"沟通"',
-      '- 「留在此页」通常在弹窗/dialog内，文字含"留在此"',
-      '- 注意候选元素中的 inDialog、inDetail、inCard 布尔值',
-      '',
-      '只输出 JSON：{"idx":0 或 -1（没找到）, "confidence":"高/中/低", "reason":"20字内"}',
+      '只输出 JSON：{"idx":候选序号, 找不到填-1, "reason":"20字内"}',
     ].join('\n');
 
     const res = await _gmPost(cfg.aiBase.replace(/\/+$/, '') + '/chat/completions', {
-      model: cfg.aiModel, temperature: 0, max_tokens: 200,
+      model: cfg.aiModel, temperature: 0, max_tokens: 150,
       messages: [{ role: 'system', content: '你是UI元素识别助手，只输出JSON' }, { role: 'user', content: prompt }],
     }, { Authorization: 'Bearer ' + key });
     if (!res) return null;
@@ -562,61 +602,52 @@
       const o = JSON.parse(m[0]);
       const idx = parseInt(o.idx, 10);
       if (isNaN(idx) || idx < 0 || idx >= candidates.length) return null;
-      log(`AI找按钮:${btnType}→候选[${idx}] ${o.reason || ''}`);
-      return candidates[idx].el; // 返回实际 DOM 元素
+      const cand = candidates[idx];
+      // 安全校验：AI 选的元素文字与目标关键词毫无关联时拒绝（防止误点危险按钮）
+      if (hint.keyword && cand.text && !cand.text.includes(hint.keyword)) {
+        log(`AI找「${hint.label}」被安全拦截：候选[${idx}]文字"${cand.text.slice(0, 10)}"不含"${hint.keyword}"`);
+        return null;
+      }
+      log(`AI找「${hint.label}」→候选[${idx}]<${cand.tag} class="${cand.class.slice(0, 30)}">"${cand.text.slice(0, 10)}" ${o.reason || ''}`);
+      return cand;
     } catch (e) { return null; }
   }
 
-  // 缓存：把 AI 找按钮的结果存下来，同页面结构不重复调 AI
+  // 缓存键：按钮类型 + 详情区指纹（同结构页面不重复调 AI）
   function _btnCacheKey(type) {
-    const fp = detailFingerprint().slice(0, 40);
-    return type + '|' + fp;
+    return type + '|' + detailFingerprint().slice(0, 40);
   }
 
-  // AI 辅助找「立即沟通」：先常规，失败则提取候选让 AI 判断
+  // 通用入口：先查缓存 → 提取候选 → AI 挑 → 缓存结果
+  async function aiLocateButton(type) {
+    const ck = _btnCacheKey(type);
+    const hit = _aiBtnCache[ck];
+    if (hit && Date.now() - hit.ts < 60000 && hit.el && isShown(hit.el)) {
+      log(`AI按钮缓存命中:「${AI_BTN_HINTS[type].label}」`);
+      return hit.el;
+    }
+    delete _aiBtnCache[ck];
+    log(`常规选择器未命中「${AI_BTN_HINTS[type].label}」，尝试AI识别...`);
+    const candidates = extractBtnCandidates();
+    if (!candidates.length) { log('AI识别失败:页面无可见按钮候选'); return null; }
+    const cand = await aiPickBtn(type, candidates);
+    if (!cand) return null;
+    if (type === 'chat') _aiBtnCache[ck] = { el: cand.el, ts: Date.now() }; // 只有立即沟通做缓存（结构稳定）
+    return cand.el;
+  }
+
+  // AI 辅助找「立即沟通」：常规 → AI
   async function findChatBtnWithAI(card) {
-    // 1. 常规查找
     const normal = findChatBtn(card);
     if (normal) return normal;
-    // 2. 缓存检查
-    const ck = _btnCacheKey('chat');
-    if (_aiBtnCache[ck] && Date.now() - _aiBtnCache[ck].ts < 60000) {
-      const el = _aiBtnCache[ck].el;
-      if (el && isShown(el)) { log('AI按钮缓存命中'); return el; }
-      delete _aiBtnCache[ck];
-    }
-    // 3. AI 判断
-    log('常规选择器未命中，尝试AI识别...');
-    const candidates = extractBtnCandidates();
-    if (!candidates.length) return null;
-    // 把元素引用附到候选上（候选是给 AI 看的文本，但我们要拿到元素）
-    candidates.forEach((c) => {
-      const all = document.querySelectorAll('a,button,div[role="button"],span[role="button"],input[type="button"],input[type="submit"],.btn,.op-btn,[class*="btn"],[class*="button"],[class*="chat"],[class*="send"]');
-      c.el = all[c.idx]; // 重新按 idx 索引拿回元素
-    });
-    const el = await aiFindBtn('立即沟通', candidates);
-    if (el) {
-      _aiBtnCache[ck] = { el, ts: Date.now() };
-      return el;
-    }
-    return null;
+    return await aiLocateButton('chat');
   }
 
-  // AI 辅助找「留在此页」：先常规，失败则提取候选让 AI 判断
+  // AI 辅助找「留在此页」：常规 → AI（弹窗是动态的，不用缓存）
   async function findStayBtnWithAI() {
-    // 1. 常规查找
     const normal = findStayBtn();
     if (normal) return normal;
-    // 2. AI 判断（留在此页通常不需要缓存，弹窗是动态的）
-    log('常规选择器未命中"留在此页"，尝试AI识别...');
-    const candidates = extractBtnCandidates();
-    if (!candidates.length) return null;
-    candidates.forEach((c) => {
-      const all = document.querySelectorAll('a,button,div[role="button"],span[role="button"],input[type="button"],input[type="submit"],.btn,.op-btn,[class*="btn"],[class*="button"],[class*="chat"],[class*="send"]');
-      c.el = all[c.idx];
-    });
-    const el = await aiFindBtn('留在此页', candidates);
-    return el || null;
+    return await aiLocateButton('stay');
   }
 
   function clickStay(btn) {
@@ -721,6 +752,15 @@
         if (await waitDialogGone(1200)) return true;
         continue;
       }
+      // 常规关闭按钮也没有 → 让 AI 找关闭按钮
+      const aiClose = await aiLocateButton('close');
+      if (aiClose) {
+        aiClose.click();
+        log('AI找到关闭按钮,已点击');
+        await sleep(rand(400, 700));
+        if (await waitDialogGone(1200)) return true;
+        continue;
+      }
       const r = detectRisk();
       if (r) { trip(r); return false; }
       break;
@@ -768,14 +808,16 @@
       () => document.querySelector('.chat-container, .chat-content, .message-container, .chat-panel, [class*="chat-"]'),
       3000, 150
     );
-    const btn = await waitFor(() => findResumeBtn(chat || document), 2500, 150);
+    let btn = await waitFor(() => findResumeBtn(chat || document), 2500, 150);
+    if (!btn) btn = await aiLocateButton('resume'); // AI 兜底
     if (!btn) {
       log('未找到"发送简历"入口，跳过附件发送');
       return false;
     }
     btn.click();
     await sleep(rand(600, 1000));
-    const ok = findConfirmBtn();
+    let ok = findConfirmBtn();
+    if (!ok) ok = await aiLocateButton('confirm'); // AI 兜底
     if (ok) {
       ok.click();
       await sleep(rand(400, 700));
