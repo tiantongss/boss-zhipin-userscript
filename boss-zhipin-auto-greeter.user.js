@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.1.2
+// @version      3.2.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.1.2 (模块化·可观测版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.2.0 (AI逐岗评估版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -251,7 +251,7 @@
     const cache = _gmGet('ai_cache', {}) || {};
     const old = cache[ck];
     if (old && typeof old.s === 'number' && old.t && Date.now() - old.t < AI_CACHE_TTL) {
-      return { score: old.s, reason: old.r || '' };
+      return { score: old.s, reason: old.r || '', fit: old.f !== false };
     }
 
     // 全局限速：两次调用间隔 ≥1000ms
@@ -260,13 +260,17 @@
     _aiLastAt = Date.now();
 
     const prompt = [
-      '判断下列岗位与候选人简历的匹配程度，按运维/IT支持/AI工程方向评估。',
+      '你是技术招聘匹配专家。判断下列岗位与候选人简历的匹配程度。',
+      '评估重点:1)岗位职责是否在候选人能力范围内(IT运维/系统运维/桌面运维/网络/服务器/IDC/技术支持/AI工程);',
+      '2)任职要求(学历/经验/技能)候选人是否基本满足;',
+      '3)明显不相关的方向(销售/开发/设计/金融/行政等)直接判不匹配。',
+      '评分标准:80-100=高度匹配;60-79=基本匹配可投递;40-59=部分匹配;0-39=不匹配。fit=是否值得投递。',
       '【简历】',
       RESUME_TEXT,
       '【岗位】' + title + ' @ ' + company,
       '【岗位描述】',
       (jd || '').slice(0, 1800),
-      '只输出 JSON：{"score":0-100,"reason":"30字内","fit":true|false}',
+      '只输出 JSON：{"score":0-100,"fit":true|false,"reason":"30字内"}',
     ].join('\n');
 
     const res = await _gmPost(cfg.aiBase.replace(/\/+$/, '') + '/chat/completions', {
@@ -288,6 +292,7 @@
       const score = Math.min(100, Math.max(0, Math.round(Number(o.score))));
       if (!isFinite(score)) return null;
       const reason = String(o.reason || '').replace(/\s+/g, ' ').slice(0, 30);
+      const fit = o.fit === false ? false : (o.fit === true ? true : score >= 60);
 
       // 写缓存：清理过期项；超过 500 条清空重建
       const now = Date.now();
@@ -296,11 +301,11 @@
         const v = cache[k];
         if (v && v.t && now - v.t < AI_CACHE_TTL) next[k] = v;
       }
-      next[ck] = { s: score, r: reason, t: now };
+      next[ck] = { s: score, r: reason, f: fit, t: now };
       const cnt = Object.keys(next).length;
       _gmSet('ai_cache', cnt > 500 ? { [ck]: next[ck] } : next);
 
-      return { score, reason };
+      return { score, reason, fit };
     } catch (e) {
       return null;
     }
@@ -608,10 +613,10 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.1.2(可观测版)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.2.0(AI逐岗评估)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
-      <label>职位名包含(逗号分隔,留空不限)</label><input id="bag-include">
+      <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
       <label>职位名排除</label><input id="bag-exclude">
       <label>公司名排除</label><input id="bag-excomp">
       <div class="row">
@@ -1278,12 +1283,15 @@
     const title = (card.querySelector(SEL.cardTitle)?.textContent || '').trim();
     const company = (card.querySelector(SEL.cardCompany)?.textContent || '').trim();
 
-    const reason = passFilter(title, company);
-    if (reason) {
-      alog('JOB_SKIPPED', `跳过:${title} @ ${company}(${reason})`,
-        { action_type: 'SKIP', target: title + ' @ ' + company, reason });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason }));
-      return 'skip';
+    // AI 模式下不做关键词预筛:每个岗位都打开详情交给 AI 逐岗评估(用户要求:逐个读取,不跳过)
+    if (!cfg.aiEnabled) {
+      const reason = passFilter(title, company);
+      if (reason) {
+        alog('JOB_SKIPPED', `跳过:${title} @ ${company}(${reason})`,
+          { action_type: 'SKIP', target: title + ' @ ' + company, reason });
+        await JobStore.put(extractJob(card, { status: 'skipped', reason }));
+        return 'skip';
+      }
     }
 
     // 每次点击前先过一遍风控检测
@@ -1325,24 +1333,7 @@
       return 'skip';
     }
 
-    let score = null, hits = [], why = '';
-    if (cfg.aiEnabled) {
-      const ai = await aiScore(title, company, jd);
-      if (ai) { score = ai.score; why = ai.reason; }
-      else log('AI 调用失败，回退本地匹配');
-    }
-    if (score == null) { const r = scoreJob(jobText, title); score = r.score; hits = r.hits; }
-    const threshold = cfg.aiEnabled ? Number(cfg.aiThreshold || 60) : Number(cfg.minScore || 45);
-    if (score < threshold) {
-      alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
-        { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score }));
-      return 'skip';
-    }
-    alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
-      { action_type: 'SCORE', target: title + ' @ ' + company, score, reason: why || hits.slice(0, 6).join('/') });
-
-    // 定位「立即沟通」：常规三级 → AI 兜底
+    // 先查沟通按钮:已沟通过的岗位直接跳过,不再浪费 AI 调用
     let btn = await waitFor(() => findChatBtn(card), 3000);
     if (!btn) btn = await aiLocateButton('chat');
     if (!btn) {
@@ -1353,10 +1344,36 @@
     const text = btn.textContent.trim();
     if (!/立即沟通|马上沟通|打招呼/.test(text)) {
       alog('JOB_SKIPPED', `已沟通过,跳过:${title} @ ${company}`,
-        { action_type: 'SKIP', target: title + ' @ ' + company, reason: '已沟通过', score });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: '已沟通过', score }));
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason: '已沟通过' });
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: '已沟通过' }));
       return 'skip';
     }
+
+    // AI 逐岗评估(AI 开启时)或本地规则打分。AI 调用失败回退规则分,阈值也回退本地阈值
+    let score = null, hits = [], why = '', aiUsed = false;
+    if (cfg.aiEnabled) {
+      const ai = await aiScore(title, company, jd);
+      if (ai) {
+        aiUsed = true; score = ai.score; why = ai.reason;
+        if (ai.fit === false) {
+          alog('JOB_SKIPPED', `跳过(AI判定不匹配${why ? ':' + why : ''}):${title} @ ${company}`,
+            { action_type: 'SKIP', target: title + ' @ ' + company, reason: 'AI不匹配:' + why, score });
+          await JobStore.put(extractJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score }));
+          return 'skip';
+        }
+      }
+      else log('AI 调用失败，回退本地匹配');
+    }
+    if (score == null) { const r = scoreJob(jobText, title); score = r.score; hits = r.hits; }
+    const threshold = aiUsed ? Number(cfg.aiThreshold || 60) : Number(cfg.minScore || 45);
+    if (score < threshold) {
+      alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score }));
+      return 'skip';
+    }
+    alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
+      { action_type: 'SCORE', target: title + ' @ ' + company, score, reason: why || hits.slice(0, 6).join('/') });
 
     // 执行点击 + 验证弹窗（doAction:定位检查→合成点击→验证→系统级兜底→结构化日志）
     // 成功判据:出现「留在此页」按钮,或出现点击前不存在的新浮层
@@ -1660,7 +1677,8 @@
     panel.style.borderColor = '#00bebd';
     Task.set('RUNNING', '任务启动');
     log(`开始运行：${kws.length} 个关键词，上限 ${cfg.max} 个投递`);
-    log(`过滤配置:包含[${cfg.include || '空(不限)'}] 排除[${cfg.exclude || '空'}] 排除公司[${cfg.excludeCompany || '空'}] 最低分[${cfg.minScore}]`);
+    if (cfg.aiEnabled) log(`评估模式:AI逐岗评估(阈值${cfg.aiThreshold || 60}分,包含/排除预筛不生效,已沟通过自动跳过)`);
+    else log(`过滤配置:包含[${cfg.include || '空(不限)'}] 排除[${cfg.exclude || '空'}] 排除公司[${cfg.excludeCompany || '空'}] 最低分[${cfg.minScore}]`);
 
     try {
       for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
