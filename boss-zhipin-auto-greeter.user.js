@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.3.1
+// @version      3.4.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.3.1 (挂机深度AI分析版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.4.0 (采集模式+导出路径)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -173,9 +173,9 @@
     ? rand(cfg.stealthMin, cfg.stealthMax) * 1000
     : rand(cfg.minDelay, cfg.maxDelay) * 1000;
 
-  // 模拟真人阅读:随机小幅滚动页面与详情区+不规则停顿,偶发合成鼠标挪动(仅挂机模式)
-  async function simulateReading() {
-    if (!cfg.stealth) return;
+  // 模拟真人阅读:随机小幅滚动页面与详情区+不规则停顿,偶发合成鼠标挪动(挂机模式或采集模式强制)
+  async function simulateReading(force) {
+    if (!cfg.stealth && !force) return;
     const rounds = 1 + Math.floor(Math.random() * 3); // 1-3 轮
     for (let i = 0; i < rounds; i++) {
       await pauseableSleep(rand(700, 2200));
@@ -251,6 +251,7 @@
     stealth: false,       // 挂机模式:低频+拟人行为(长间隔/随机阅读滚动/定时休息),降低风控命中
     stealthMin: 30,       // 挂机模式每岗间隔下限(秒)
     stealthMax: 75,       // 挂机模式每岗间隔上限(秒)
+    exportPath: 'boss-jobs.csv', // 采集数据导出路径(经本地服务写入;相对路径存到脚本目录,可填绝对路径)
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
     aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
@@ -727,7 +728,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.3.1(挂机深度分析)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.4.0(采集模式)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -766,6 +767,10 @@
         <button id="bag-stop">停止</button>
       </div>
       <div class="row">
+        <button id="bag-collect" style="background:#2e8b57">开始采集(不投递)</button>
+      </div>
+      <label>导出路径(经本地服务写入;相对路径存到脚本目录,可填绝对路径)</label><input id="bag-exportpath" placeholder="如 boss-jobs.csv 或 D:\data\jobs.csv">
+      <div class="row">
         <button id="bag-unlock" style="background:#888; margin-top:4px;">解除冷却(已手动处理)</button>
       </div>
       <div class="row">
@@ -792,6 +797,7 @@
   $('bag-stealth').checked = !!cfg.stealth;
   $('bag-stmin').value = cfg.stealthMin;
   $('bag-stmax').value = cfg.stealthMax;
+  $('bag-exportpath').value = cfg.exportPath;
   $('bag-minScore').value = cfg.minScore;
   $('bag-aiEnabled').checked = !!cfg.aiEnabled;
   $('bag-realClick').checked = !!cfg.realClick;
@@ -840,6 +846,7 @@
     cfg.stealth = $('bag-stealth').checked;
     cfg.stealthMin = Math.max(10, +$('bag-stmin').value || DEFAULTS.stealthMin);
     cfg.stealthMax = Math.max(cfg.stealthMin, +$('bag-stmax').value || DEFAULTS.stealthMax);
+    cfg.exportPath = $('bag-exportpath').value.trim() || DEFAULTS.exportPath;
     cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
     cfg.aiEnabled = !!$('bag-aiEnabled').checked;
     cfg.realClick = !!$('bag-realClick').checked;
@@ -1359,14 +1366,17 @@
         } catch (e) { res([]); }
       });
     }
-    async function exportCsv() {
-      const rows = await all();
-      const head = ['岗位', '公司', '薪资', '地区', '匹配度', '状态', '评估理由', 'AI综合评估', 'JD摘要', '时间', '链接'];
+    function toCsv(rows) {
+      const head = ['岗位', '公司', '薪资', '地区', '经验/学历', '公司信息', 'HR', '匹配度', '状态', '评估理由', 'AI综合评估', 'JD摘要', '时间', '链接'];
       const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
       const lines = [head.join(',')].concat(
-        rows.map((j) => [j.title, j.company, j.salary, j.area, j.score, j.status, j.reason, j.aiEval, (j.jd || '').slice(0, 120), j.ts, j.url].map(esc).join(','))
+        rows.map((j) => [j.title, j.company, j.salary, j.area, j.tags, j.companyInfo, j.hr, j.score, j.status, j.reason, j.aiEval, (j.jd || '').slice(0, 120), j.ts, j.url].map(esc).join(','))
       );
-      const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv' });
+      return '﻿' + lines.join('\n');
+    }
+    async function exportCsv() {
+      const rows = await all();
+      const blob = new Blob([toCsv(rows)], { type: 'text/csv' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = 'boss-jobs-' + new Date().toISOString().slice(0, 10) + '.csv';
@@ -1374,7 +1384,7 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
       return rows.length;
     }
-    return { put, all, exportCsv };
+    return { put, all, toCsv, exportCsv };
   })();
 
   // 卡片去重键（DOM 节点会重渲染，用字符串键）
@@ -1404,6 +1414,17 @@
       status: (meta && meta.status) || 'seen',
       ts: new Date().toISOString(),
     };
+  }
+
+  // 采集模式:全字段提取(卡片标签+详情区公司信息+完整JD)
+  function extractFull(card, meta) {
+    const base = extractJob(card, meta);
+    const q = (sel) => (card.querySelector(sel)?.textContent || '').trim();
+    base.tags = (q('.tag-list') || q('.job-card-footer') || '').replace(/\s+/g, ' ');
+    base.hr = (q('.info-public') || q('.boss-name') || '').replace(/\s+/g, ' ');
+    base.companyInfo = readCompanyInfo();
+    base.jd = readJd().slice(0, 2000);
+    return base;
   }
 
   async function processCard(card) {
@@ -1874,6 +1895,104 @@
     log(`结束，本次共投递 ${sent} 个`);
   }
 
+  /* ===================== 采集模式:不投递,拟人节奏逐卡全字段采集 ===================== */
+  // 经本地服务把内容写入指定路径;失败返回 null(服务离线或路径非法)
+  async function serverSave(filePath, content) {
+    const r = await _gmPost('http://127.0.0.1:8901/save', { path: filePath, content }, {});
+    return r && r.ok ? (r.saved || filePath) : null;
+  }
+
+  // 智能导出:优先写到面板配置的导出路径(需本地服务),服务离线回退浏览器下载
+  async function exportJobsSmart() {
+    const rows = await JobStore.all();
+    if (!rows.length) { log('岗位库为空,没有可导出的数据'); return 0; }
+    const saved = await serverSave(cfg.exportPath, JobStore.toCsv(rows));
+    if (saved) { log(`已导出岗位数据 ${rows.length} 条 → ${saved}`); return rows.length; }
+    const n = await JobStore.exportCsv();
+    log(`本地服务离线,已改用浏览器下载 CSV(${n} 条)`);
+    return n;
+  }
+
+  // 单个关键词:从首卡走到列表底部,逐卡打开详情,全字段提取入库
+  async function collectKeyword(kw) {
+    let idx = 0, dryRounds = 0, got = 0;
+    while (Task.working) {
+      await checkpoint();
+      const r = detectRisk();
+      if (r) { trip(r); return; }
+
+      const cards = [...document.querySelectorAll(SEL.card)];
+      if (!cards.length) {
+        if (++dryRounds >= 3) { log(`「${kw}」列表为空,跳过`); return; }
+        await sleep(1500);
+        continue;
+      }
+      if (idx >= cards.length) {
+        const more = await loadMore();
+        if (more) { dryRounds = 0; continue; }
+        if (++dryRounds >= 2) { log(`「${kw}」采集完成,共 ${got} 条`); return; }
+        await sleep(1500);
+        continue;
+      }
+      dryRounds = 0;
+
+      const card = cards[idx];
+      idx++;
+      const ck = cardKey(card);
+      if (seen.has(ck)) continue;
+      seen.add(ck);
+
+      const opened = await openDetail(card);
+      await simulateReading(true); // 采集模式强制拟人阅读节奏
+      const rec = extractFull(card, { status: 'collected' });
+      if (!opened) rec.reason = '详情未打开,仅卡片字段';
+      await JobStore.put(rec);
+      got++;
+      alog('JOB_COLLECTED', `采集(${got}):${rec.title} @ ${rec.company}`,
+        { action_type: 'COLLECT', target: rec.title + ' @ ' + rec.company, result: 'saved' });
+      // 拟人随机间隔(复用挂机间隔配置)
+      await pauseableSleep(rand(cfg.stealthMin, cfg.stealthMax) * 1000);
+    }
+  }
+
+  async function runCollect() {
+    readCfg();
+    if (Task.working) { log('任务运行中,请先停止'); return; }
+    const kws = String(cfg.keywords || '').split(/\r?\n|,|，/).map((s) => s.trim()).filter(Boolean);
+    if (!kws.length) { log('请先填写职位关键词'); return; }
+
+    Logger.newTask({ mode: 'collect', keywords: kws, exportPath: cfg.exportPath });
+    Task.set('RUNNING', '采集启动');
+    seen.clear();
+    $('bag-collect').disabled = true;
+    $('bag-start').disabled = true;
+    log(`采集模式:${kws.length} 个关键词,拟人间隔${cfg.stealthMin}-${cfg.stealthMax}s/岗,完成后导出到[${cfg.exportPath}]`);
+
+    try {
+      for (let i = 0; i < kws.length && Task.working; i++) {
+        await checkpoint();
+        const kw = kws[i];
+        log(`=== 采集 (${i + 1}/${kws.length})「${kw}」 ===`);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        await sleep(rand(600, 1000));
+        const okSearch = await doSearch(kw);
+        if (!okSearch) { log(`「${kw}」搜索失败,跳过`); continue; }
+        await collectKeyword(kw);
+      }
+      if (Task.working) Task.set('COMPLETED', '采集完成');
+    } catch (e) {
+      if (e && e.name === 'StopError') log('已停止');
+      else { Task.set('FAILED', e.message); log('采集异常:' + e.message); }
+    }
+
+    Logger.endTask(Task.state, {});
+    _gmSet('bag_hb', 0);
+    $('bag-collect').disabled = false;
+    $('bag-start').disabled = false;
+    const n = await exportJobsSmart(); // 采集结束自动导出到配置路径
+    log(`采集结束,导出 ${n} 条`);
+  }
+
   /* ===================== 按钮绑定 ===================== */
   $('bag-start').onclick = () => !Task.working && run();
   $('bag-pause').onclick = () => {
@@ -1895,9 +2014,10 @@
     const n = Logger.exportFile();
     log(`已导出诊断日志 JSON(${n} 条)`);
   };
+  $('bag-collect').onclick = () => !Task.working && runCollect();
   $('bag-exportjobs').onclick = async () => {
-    const n = await JobStore.exportCsv();
-    log(`已导出岗位数据 CSV(${n} 条)`);
+    readCfg();
+    await exportJobsSmart();
   };
   $('bag-unlock').onclick = () => {
     const l = _gmGet('bag_lock', null);
