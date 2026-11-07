@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.2
-// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止
+// @version      1.2.3
+// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
@@ -36,7 +36,7 @@
     ta.remove();
   };
 
-  console.log('[%s] 脚本已加载 v1.2.2 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.2.3 (安全增强版)', 'BOSS海投助手');
 
   /* ===================== 配置 ===================== */
   const DEFAULTS = {
@@ -232,8 +232,8 @@
     const els = document.querySelectorAll('a,button,span,div,p,li');
     for (const el of els) {
       if (el.offsetParent === null) continue;
-      if (/^\s*留在此页面?\s*$/.test(el.textContent)) {
-        const inner = [...el.querySelectorAll('*')].find((c) => /^\s*留在此页面?\s*$/.test(c.textContent));
+      if (/^\s*留在此(?:页面?|界面?)\s*$/.test(el.textContent)) {
+        const inner = [...el.querySelectorAll('*')].find((c) => /^\s*留在此(?:页面?|界面?)\s*$/.test(c.textContent));
         return inner || el;
       }
     }
@@ -260,6 +260,51 @@
       log('未找到"留在此页",已点关闭按钮');
       await sleep(500);
     }
+  }
+
+  /* ===== 发送简历附件 ===== */
+  const RESUME_TEXT = /^(发送简历|发简历|附件简历|发送附件简历|简历附件)$/;
+
+  function findResumeBtn(scope) {
+    const root = scope || document;
+    const els = root.querySelectorAll('a,button,span,div,li,i');
+    for (const el of els) {
+      if (el.offsetParent === null) continue;
+      if (RESUME_TEXT.test((el.textContent || '').trim())) {
+        const inner = [...el.querySelectorAll('*')].find((c) => RESUME_TEXT.test((c.textContent || '').trim()));
+        return inner || el;
+      }
+    }
+    return null;
+  }
+
+  function findConfirmBtn() {
+    const dlg = document.querySelector('.dialog-container, .greet-boss-dialog, [class*="dialog"]');
+    if (!dlg) return null;
+    return [...dlg.querySelectorAll('a,button,span,div')].find(
+      (el) => el.offsetParent !== null && /^(发送|确定|确认发送)$/.test((el.textContent || '').trim())
+    );
+  }
+
+  async function sendResumeAttachment() {
+    const chat = await waitFor(
+      () => document.querySelector('.chat-container, .chat-content, .message-container, .chat-panel, [class*="chat-"]'),
+      3000, 150
+    );
+    const btn = await waitFor(() => findResumeBtn(chat || document), 2500, 150);
+    if (!btn) {
+      log('未找到"发送简历"入口，跳过附件发送');
+      return false;
+    }
+    btn.click();
+    await sleep(rand(600, 1000));
+    const ok = findConfirmBtn();
+    if (ok) {
+      ok.click();
+      await sleep(rand(400, 700));
+    }
+    log('✔ 已发送简历附件');
+    return true;
   }
 
   // 突变监听：发现阻断弹窗自动点留在此页
@@ -318,8 +363,10 @@
     }
 
     await closeDialog();
+    await sleep(rand(600, 1000));
+    const resumeSent = await sendResumeAttachment();
     sent++;
-    log(`✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}`);
+    log(`✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`);
     return 'ok';
   }
 
