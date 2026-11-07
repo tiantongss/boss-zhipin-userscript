@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      2.0.2
+// @version      2.1.0
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）；按关键词队列依次搜索，列表滚动到底自动切换下一个关键词，异常时由 AI 从有限动作集中选择处置动作
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -60,7 +60,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v2.0.2 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v2.1.0 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -293,6 +293,27 @@
     return r.width > 0 && r.height > 0;
   }
 
+  // 模拟真实点击：滚动到可视区 + 完整鼠标事件序列，兼容 React 合成事件
+  function humanClick(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+    const r = el.getBoundingClientRect();
+    const opt = {
+      bubbles: true, cancelable: true, view: window, button: 0,
+      clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+    };
+    try {
+      el.dispatchEvent(new PointerEvent('pointerdown', opt));
+      el.dispatchEvent(new MouseEvent('mousedown', opt));
+      el.dispatchEvent(new PointerEvent('pointerup', opt));
+      el.dispatchEvent(new MouseEvent('mouseup', opt));
+      el.dispatchEvent(new MouseEvent('click', opt));
+    } catch (e) {
+      el.click();
+    }
+    return true;
+  }
+
   function detectRisk() {
     if (RISK.url.test(location.pathname + location.search)) return '网址疑似验证/登录/错误页:' + location.pathname;
     if (RISK.title.test(document.title)) return '页面标题异常:' + document.title;
@@ -493,36 +514,62 @@
     }) || null;
   }
 
-  // 打开岗位详情：先点标题，再兜底整卡点击
+  // 详情区指纹：标题 + JD 长度 + JD 前 30 字，用于判断详情是否真的切换了岗位
+  function detailFingerprint() {
+    let t = '';
+    for (const b of document.querySelectorAll(SEL.detailBox)) {
+      if (!visible(b)) continue;
+      const el = b.querySelector(SEL.cardTitle);
+      if (el && (el.textContent || '').trim()) { t = (el.textContent || '').trim(); break; }
+    }
+    const jd = [...document.querySelectorAll(SEL.jdText)]
+      .filter(visible).map((e) => (e.textContent || '').trim()).join('');
+    return `${t}|${jd.length}|${jd.slice(0, 30)}`;
+  }
+
+  // 打开岗位详情：点标题后等「指纹变化」，避免读到上一个岗位残留的 JD
   async function openDetail(card) {
+    const before = detailFingerprint();
     const hasJd = () => [...document.querySelectorAll(SEL.jdText)]
       .some((el) => visible(el) && (el.textContent || '').trim().length > 30);
-    card.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    await sleep(rand(400, 700));
+    const switched = () => hasJd() && detailFingerprint() !== before;
+
+    card.scrollIntoView({ block: 'center' });
+    await sleep(rand(250, 450));
     const titleEl = card.querySelector(SEL.cardTitle);
-    (titleEl || card).click();
-    await sleep(rand(700, 1100));
-    if (await waitFor(hasJd, 2200, 150)) return true;
-    card.click();
-    await sleep(rand(600, 900));
-    if (await waitFor(hasJd, 2500, 150)) return true;
-    return false;
+    humanClick(titleEl || card);
+    if (await waitFor(switched, 2800, 150)) return true;
+    humanClick(card);
+    if (await waitFor(switched, 2800, 150)) return true;
+    // 指纹没变但页面本来就有 JD（首个岗位默认已展开），也算可用
+    return hasJd();
   }
 
   // 找「立即沟通」按钮：详情容器 → 整页 → 当前卡片内，共三级兜底
+  const CHAT_TEXT = /^(立即沟通|继续沟通|马上沟通|打招呼)$/;
+
   function findChatBtn(card) {
     const boxes = [...document.querySelectorAll(SEL.detailBox)].filter(visible);
     for (const b of boxes) {
-      const el = b.querySelector(SEL.chatBtn) || btnByText(b, /^立即沟通$/);
+      const el = b.querySelector(SEL.chatBtn) || btnByText(b, CHAT_TEXT);
       if (el) return el;
     }
-    const loose = btnByText(document.body, /^立即沟通$/);
+    const loose = btnByText(document.body, CHAT_TEXT);
     if (loose && !loose.closest(SEL.card)) return loose;
     if (card) {
-      const inCard = card.querySelector(SEL.chatBtn) || btnByText(card, /^立即沟通$/);
+      const inCard = card.querySelector(SEL.chatBtn) || btnByText(card, CHAT_TEXT);
       if (inCard) return inCard;
     }
     return null;
+  }
+
+  // 找不到按钮时，把页面上疑似沟通类按钮的 class 打出来，方便定位改版
+  function logChatCandidates() {
+    const els = [...document.querySelectorAll('a,button,div,span')]
+      .filter((e) => visible(e) && /沟通|打招呼/.test((e.textContent || '').trim().slice(0, 8)));
+    if (!els.length) { log('候选:页面无任何"沟通"类按钮'); return; }
+    const desc = els.slice(0, 6).map((e) => `<${e.tagName.toLowerCase()} class="${String(e.className || '').slice(0, 34)}">${(e.textContent || '').trim().slice(0, 8)}`);
+    log('候选:' + desc.join(' | '));
   }
 
   function anyDialog() {
@@ -644,7 +691,23 @@
       return 'halt';
     }
 
-    const opened = await openDetail(card);
+    let opened = await openDetail(card);
+    // 校验详情区标题是否真的切到了这张卡对应的岗位，不一致说明点击没生效
+    const detailTitle = () => {
+      for (const b of document.querySelectorAll(SEL.detailBox)) {
+        if (!visible(b)) continue;
+        const el = b.querySelector(SEL.cardTitle);
+        if (el && (el.textContent || '').trim()) return (el.textContent || '').trim();
+      }
+      return '';
+    };
+    const dTitle = detailTitle();
+    if (dTitle && title && !dTitle.includes(title.slice(0, 6)) && !title.includes(dTitle.slice(0, 6))) {
+      log(`详情未切换(卡片:${title} 详情:${dTitle})，重试一次`);
+      humanClick(card);
+      await sleep(rand(700, 1100));
+      opened = await openDetail(card);
+    }
     const jdEl = opened
       ? [...document.querySelectorAll(SEL.jdText)].find((el) => visible(el) && (el.textContent || '').trim().length > 30) || null
       : null;
@@ -673,16 +736,17 @@
     const btn = await waitFor(() => findChatBtn(card), 4000);
     if (!btn) {
       log(`未找到沟通按钮:${title}｜详情面板${opened ? '已打开' : '未打开'}`);
+      logChatCandidates();
       return 'fail';
     }
     const text = btn.textContent.trim();
-    if (!/立即沟通/.test(text)) {
+    if (!/立即沟通|马上沟通|打招呼/.test(text)) {
       log(`已沟通过,跳过:${title} @ ${company}`);
       return 'skip';
     }
 
-    log(`点击沟通按钮:"${btn.textContent.trim()}"(${btn.className || btn.tagName})`);
-    btn.click();
+    log(`点击沟通按钮:"${text}"(${btn.className || btn.tagName})`);
+    humanClick(btn);
     // 等「留在此页」弹窗出现（最多 4 秒），出现后立即处理
     await waitFor(anyDialog, 4000, 120);
 
