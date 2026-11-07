@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.0.1
+// @version      3.1.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.0.1 (模块化·可观测版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.1.0 (模块化·可观测版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -385,6 +385,7 @@
   }
 
   // 模拟真实点击：滚动到可视区 + 完整鼠标事件序列，兼容 React 合成事件
+  // 在元素自身、最近可点击祖先(a/button)、内部子元素三层同时派发，提高命中率
   function humanClick(el) {
     if (!el) return false;
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
@@ -393,14 +394,21 @@
       bubbles: true, cancelable: true, view: window, button: 0,
       clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
     };
-    try {
-      el.dispatchEvent(new PointerEvent('pointerdown', opt));
-      el.dispatchEvent(new MouseEvent('mousedown', opt));
-      el.dispatchEvent(new PointerEvent('pointerup', opt));
-      el.dispatchEvent(new MouseEvent('mouseup', opt));
-      el.dispatchEvent(new MouseEvent('click', opt));
-    } catch (e) {
-      el.click();
+    const targets = [el];
+    const link = el.closest('a,button,[role="button"]');
+    if (link && link !== el && !targets.includes(link)) targets.push(link);
+    const inner = el.querySelector('span,div,i,em');
+    if (inner && !targets.includes(inner)) targets.push(inner);
+    for (const t of targets) {
+      try {
+        t.dispatchEvent(new PointerEvent('pointerdown', opt));
+        t.dispatchEvent(new MouseEvent('mousedown', opt));
+        t.dispatchEvent(new PointerEvent('pointerup', opt));
+        t.dispatchEvent(new MouseEvent('mouseup', opt));
+        t.dispatchEvent(new MouseEvent('click', opt));
+      } catch (e) {
+        try { t.click(); } catch (e2) {}
+      }
     }
     return true;
   }
@@ -416,14 +424,19 @@
   }
 
   // 真实鼠标点击兜底：合成事件被页面忽略时使用。true=已派发
+  // 坐标与窗口参数全部入日志,点没点准可以从导出日志直接核对
   async function sysClick(el, label) {
     if (!cfg.realClick || !el) return false;
     if (!document.hasFocus()) { log(`跳过系统点击[${label}]:浏览器窗口不在前台(需保持BOSS窗口可见)`); return false; }
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
     await sleep(350);
     const p = elScreenPos(el);
+    alog('SYS_CLICK', `系统级点击[${label}] 屏幕坐标(${p.x},${p.y})`, {
+      action_type: 'CLICK', target: label, execution_method: 'system', pos: p,
+      win: { sx: window.screenX, sy: window.screenY, ow: window.outerWidth, oh: window.outerHeight, iw: window.innerWidth, ih: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+    });
     const res = await _gmPost('http://127.0.0.1:8901/click', p, {});
-    if (res && res.ok) { log(`系统级点击[${label}] (${p.x},${p.y})`); return true; }
+    if (res && res.ok) return true;
     log(`系统级点击失败[${label}]:本地服务未响应`);
     return false;
   }
@@ -541,9 +554,17 @@
     let ok = await waitFor(safeVerify, timeout, 150);
     let method = 'synthetic';
 
-    // 验证失败 → 升级系统级真实点击
+    // 第二档：原生 click()(部分处理器只挂 onclick)
+    if (!ok) {
+      alog('CLICK_ATTEMPT', `${name}:合成点击未通过验证,尝试原生click()`, { action_type: 'CLICK', target: name, execution_method: 'native' });
+      try { el.click(); } catch (e) {}
+      ok = await waitFor(safeVerify, Math.min(timeout, 2500), 150);
+      if (ok) method = 'native';
+    }
+
+    // 第三档：系统级真实点击
     if (!ok && sys && cfg.realClick) {
-      alog('CLICK_ATTEMPT', `${name}:合成点击未通过验证,升级系统级点击`, { action_type: 'CLICK', target: name, execution_method: 'system' });
+      alog('CLICK_ATTEMPT', `${name}:升级系统级点击`, { action_type: 'CLICK', target: name, execution_method: 'system' });
       if (await sysClick(el, name)) {
         method = 'system';
         ok = await waitFor(safeVerify, timeout, 150);
@@ -554,8 +575,10 @@
       alog('ACTION_SUCCESS', `${name}:验证通过(${method}${verifyDesc ? ',' + verifyDesc : ''})`,
         { action_type: 'CLICK', target: name, execution_method: method, result: 'success', state_changed: true, url_after: location.href });
     } else {
-      alog('ACTION_TIMEOUT', `${name}:执行后未检测到预期变化(${method})`,
-        { action_type: 'CLICK', target: name, execution_method: method, result: 'timeout', state_changed: false, url_after: location.href });
+      // 失败诊断：抓取浮层快照 + 成功提示词 + 焦点状态,导出日志即可定位卡在哪一环
+      const diag = { overlays: dumpOverlays(), sent_hint: sentHint(), focus: document.hasFocus() };
+      alog('ACTION_TIMEOUT', `${name}:执行后未检测到预期变化(${method}${diag.sent_hint ? ',但页面出现成功提示词' : ''})`,
+        { action_type: 'CLICK', target: name, execution_method: method, result: 'timeout', state_changed: false, url_after: location.href, diag });
     }
     return { ok, el, method };
   }
@@ -584,7 +607,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.0.1(可观测版)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.1.0(可观测版)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限)</label><input id="bag-include">
@@ -946,6 +969,15 @@
       const el = b.querySelector(SEL.chatBtn) || btnByText(b, CHAT_TEXT);
       if (el) return el;
     }
+    // 兜底:详情区内任何文字含"沟通"的可点元素
+    for (const b of boxes) {
+      const el = [...b.querySelectorAll('a,button,div,span')].find((e) => {
+        if (!isShown(e)) return false;
+        const t = (e.textContent || '').replace(/\s+/g, '');
+        return t.length <= 10 && /沟通/.test(t) && (e.closest('a,button,[role="button"]') || /btn/i.test(String(e.className || '')));
+      });
+      if (el) return el.closest('a,button,[role="button"]') || el;
+    }
     const loose = btnByText(document.body, CHAT_TEXT);
     if (loose && !loose.closest(SEL.card)) return loose;
     if (card) {
@@ -970,6 +1002,47 @@
 
   async function waitDialogGone(timeout) {
     return await waitFor(() => !anyDialog(), timeout, 120);
+  }
+
+  // 通用浮层检测：不依赖具体类名,任何可见的 dialog/modal/popup 类容器
+  function anyOverlay() {
+    const cands = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [class*="dialog"], [class*="Dialog"], [class*="modal"], [class*="Modal"], [class*="popup"], [class*="Popup"]');
+    for (const el of cands) {
+      if (!isShown(el)) continue;
+      if (el.closest('#bag-panel')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 100 || r.height < 60) continue;
+      return el;
+    }
+    return null;
+  }
+
+  // 失败诊断：抓取页面上所有大尺寸 fixed/absolute 浮层的类名/文字/位置
+  function dumpOverlays() {
+    const out = [];
+    const all = document.querySelectorAll('body *');
+    for (const el of all) {
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+      if (!isShown(el) || el.closest('#bag-panel')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 150 || r.height < 100) continue;
+      out.push({
+        tag: el.tagName.toLowerCase(),
+        cls: String(el.className || '').slice(0, 60),
+        text: (el.textContent || '').replace(/\s+/g, '').slice(0, 40),
+        rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+        z: cs.zIndex,
+      });
+      if (out.length >= 10) break;
+    }
+    return out;
+  }
+
+  // 成功提示词检测(点击后页面可能出现"已向BOSS发送消息"等提示)
+  function sentHint() {
+    const t = (document.body.innerText || '').slice(0, 8000);
+    return /已向BOSS发送消息|发送成功|已打招呼|沟通已发送/.test(t);
   }
 
   // 点「留在此页」关掉弹窗；true=已清空，false=关不掉
@@ -998,6 +1071,16 @@
       if (close) {
         close.click();
         log('未找到"留在此页",已点关闭按钮');
+        await sleep(rand(400, 700));
+        if (await waitDialogGone(1200)) return true;
+        continue;
+      }
+      // 通用浮层关闭按钮兜底(不依赖具体弹窗类名)
+      const ov = anyOverlay();
+      const ovClose = ov && [...ov.querySelectorAll('[class*="close"], [class*="Close"], [aria-label*="关闭"], [aria-label="Close"]')].find(isShown);
+      if (ovClose) {
+        humanClick(ovClose);
+        log('已点击浮层关闭按钮');
         await sleep(rand(400, 700));
         if (await waitDialogGone(1200)) return true;
         continue;
@@ -1269,10 +1352,16 @@
     }
 
     // 执行点击 + 验证弹窗（doAction:定位检查→合成点击→验证→系统级兜底→结构化日志）
+    // 成功判据:出现「留在此页」按钮,或出现点击前不存在的新浮层
+    const overlayBefore = anyOverlay();
     const clickRes = await doAction({
       name: '立即沟通',
       find: () => (isShown(btn) ? btn : findChatBtn(card)),
-      verify: () => anyDialog(),
+      verify: () => {
+        if (findStayBtn()) return true;
+        const ov = anyDialog() || anyOverlay();
+        return ov && ov !== overlayBefore ? ov : null;
+      },
       timeout: 4000,
       verifyDesc: '弹窗出现',
     });
@@ -1432,10 +1521,15 @@
         return;
       }
       const chatBtn = btn;
+      const overlayBefore = anyOverlay();
       const r1 = await doAction({
         name: '立即沟通',
         find: () => (isShown(chatBtn) ? chatBtn : findChatBtn(card)),
-        verify: () => anyDialog(),
+        verify: () => {
+          if (findStayBtn()) return true;
+          const ov = anyDialog() || anyOverlay();
+          return ov && ov !== overlayBefore ? ov : null;
+        },
         timeout: 4000,
         verifyDesc: '弹窗出现',
       });
