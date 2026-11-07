@@ -61,7 +61,8 @@ http.createServer(async (req, res) => {
       if (!/^[^<>:"|?*]{1,260}\.(csv|json)$/i.test(p) || p.includes('..')) throw new Error('bad path');
       const full = path.isAbsolute(p) ? p : path.join(dir, p);
       fs.mkdirSync(path.dirname(full), { recursive: true });
-      fs.writeFileSync(full, content, 'utf8');
+      if (body.append) fs.appendFileSync(full, content, 'utf8');
+      else fs.writeFileSync(full, content, 'utf8');
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true, saved: full }));
     } catch (e) {
