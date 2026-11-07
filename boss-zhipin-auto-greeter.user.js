@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      2.5.0
-// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）；按关键词队列依次搜索，列表滚动到底自动切换下一个关键词，异常时由 AI 从有限动作集中选择处置动作
+// @version      3.0.0
+// @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
@@ -36,13 +36,6 @@
     if (typeof GM_addStyle === 'function') { try { return GM_addStyle(css); } catch (e) {} }
     const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s;
   };
-  const _gmClip = (text) => {
-    if (typeof GM_setClipboard === 'function') { try { GM_setClipboard(text); return; } catch (e) {} }
-    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); } catch (e) { console.warn('[兼容层] 复制失败', e); }
-    ta.remove();
-  };
   const _gmPost = (url, data, headers) => new Promise((resolve) => {
     const body = JSON.stringify(data);
     const done = (txt, err) => { if (err) resolve(null); else { try { resolve(JSON.parse(txt)); } catch (e) { resolve(null); } } };
@@ -61,11 +54,118 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v2.5.0 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.0.0 (模块化·可观测版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
   );
+
+  /* ===================== 工具函数 ===================== */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const list = (s) => s.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
+
+  async function waitFor(fn, timeout = 5000, step = 150) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      let v = null;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return v;
+      await sleep(step);
+    }
+    return null;
+  }
+
+  /* ============================================================
+   * 模块0：统一诊断日志（P0）
+   * 每次操作分配唯一 action_id，结构化记录：操作类型/元素/执行方式/前后状态/结果
+   * 面板「导出诊断日志」可下载完整 JSON，交给 AI 即可定位问题环节
+   * ============================================================ */
+  const Logger = (() => {
+    const MAX = 3000;
+    const buf = [];
+    let taskId = null, seq = 0;
+    function push(type, msg, data) {
+      seq++;
+      const e = Object.assign({
+        task_id: taskId || '-',
+        action_id: (taskId || 'BOOT') + '-' + String(seq).padStart(4, '0'),
+        ts: new Date().toISOString(),
+        type,
+        msg,
+        url: location.href,
+      }, data || {});
+      buf.push(e);
+      if (buf.length > MAX) buf.splice(0, buf.length - MAX);
+      return e;
+    }
+    function newTask(meta) {
+      taskId = 'T' + Date.now().toString(36).toUpperCase();
+      seq = 0;
+      push('TASK_START', '任务开始', meta || {});
+    }
+    function endTask(result, meta) {
+      if (!taskId) return;
+      push('TASK_END', '任务结束:' + result, Object.assign({ result }, meta || {}));
+      // 落盘最近 300 条,页面崩溃/跳转后仍可找回
+      try { _gmSet('last_log', buf.slice(-300)); } catch (e) {}
+    }
+    function exportFile() {
+      const data = buf.length ? buf : (_gmGet('last_log', []) || []);
+      const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'boss-helper-log-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      return data.length;
+    }
+    return { push, newTask, endTask, exportFile, size: () => buf.length };
+  })();
+
+  // 结构化日志 + 面板人类可读日志（log 在 UI 区定义,函数声明提升,运行时才调用,安全）
+  function alog(type, msg, data) {
+    Logger.push(type, msg, data);
+    log(msg);
+  }
+
+  /* ============================================================
+   * 模块1：任务控制中心（状态机）
+   * IDLE/RUNNING/PAUSED/WAITING/NEEDS_HUMAN/FAILED/COMPLETED/STOPPED
+   * 暂停/停止通过 checkpoint() 在每个操作间隙真实生效
+   * ============================================================ */
+  const STATE_NAMES = {
+    IDLE: '空闲', INITIALIZING: '初始化', RUNNING: '运行中', PAUSED: '已暂停',
+    WAITING: '等待页面', NEEDS_HUMAN: '需人工处理', FAILED: '失败', COMPLETED: '完成', STOPPED: '已停止',
+  };
+  const Task = {
+    state: 'IDLE',
+    set(s, why) {
+      if (this.state === s) return;
+      const from = this.state;
+      this.state = s;
+      alog('STATE', `状态:${STATE_NAMES[from] || from} → ${STATE_NAMES[s] || s}${why ? '(' + why + ')' : ''}`, { from, to: s });
+      try { updateStatus(); } catch (e) {}
+    },
+    // working: 任务未终结（含暂停,暂停时 checkpoint 会卡住等待）
+    get working() { return this.state === 'RUNNING' || this.state === 'WAITING' || this.state === 'PAUSED'; },
+    // active: 正在真正执行（暂停时不执行新操作）
+    get active() { return this.state === 'RUNNING' || this.state === 'WAITING'; },
+  };
+  class StopError extends Error { constructor() { super('__STOP__'); this.name = 'StopError'; } }
+  // 每个操作间隙调用:暂停时阻塞等待,停止/熔断时抛 StopError 终止任务
+  async function checkpoint() {
+    while (Task.state === 'PAUSED') await sleep(400);
+    if (!Task.working) throw new StopError();
+  }
+  // 可中断长睡眠：每 400ms 醒一次响应暂停/停止
+  async function pauseableSleep(ms) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      await sleep(400);
+      await checkpoint();
+    }
+  }
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -108,6 +208,36 @@
     const score = Math.min(100, Math.round(skillScore * 0.75 + (titleHit ? 25 : 0)));
     return { score, hits };
   }
+
+  /* ===================== 配置 ===================== */
+  const DEFAULTS = {
+    keywords: '运维工程师\n桌面运维\nIT支持',  // 每行一个职位关键词，按顺序搜索
+    include: '',          // 职位名必须包含其一(逗号分隔,留空不限)
+    exclude: '外包,销售,实习', // 职位名含其一则跳过
+    excludeCompany: '',   // 公司名含其一则跳过
+    minScore: 45,   // 岗位匹配度阈值(低于此分跳过)
+    max: 50,              // 本次最多投递数量
+    minDelay: 8,          // 每次投递最小间隔(秒)
+    maxDelay: 20,         // 每次投递最大间隔(秒)
+    maxFail: 3,           // 连续失败N条即熔断停止
+    cooldownMin: 30,      // 熔断后冷却(分钟)
+    aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
+    realClick: true,   // 合成点击无效时，升级系统级真实鼠标点击(需本地服务 127.0.0.1:8901)
+  };
+  const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
+
+  // 选择器集中放这里,BOSS 改版后只需改这里
+  const SEL = {
+    card: '.job-card-wrapper, .job-card-box, li.job-card-wrapper',
+    cardTitle: '.job-name, .job-title',
+    cardCompany: '.company-name, .boss-name',
+    detail: '.job-detail-box, .job-detail',
+    detailBox: '#job-detail, .job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap',
+    chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat, [ka*="job-detail-chat"], .job-detail-op .btn, .job-detail-container .btn-startchat, .job-detail-op .btn-startchat',
+    nextPage: '.options-pages a.next, .options-pages .next',
+    dialog: '.dialog-container, .greet-boss-dialog',
+    jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text',
+  };
 
   /* ===== AI 语义匹配（OpenAI 兼容 /chat/completions） ===== */
   const AI_CACHE_TTL = 7 * 24 * 3600 * 1000;
@@ -222,57 +352,12 @@
 
   // 执行 AI 给出的动作；返回 false 表示应当终止
   async function applyAiAction(act) {
-    if (act === 'abort') { running = false; log('AI 判定应停止'); return false; }
+    if (act === 'abort') { Task.set('STOPPED', 'AI判定停止'); return false; }
     if (act === 'close_dialog') return await closeDialog();
     if (act === 'scroll_bottom') { await loadMore(); return true; }
     if (act === 'scroll_top') { window.scrollTo({ top: 0, behavior: 'smooth' }); await sleep(rand(800, 1200)); return true; }
     if (act === 'retry' || act === 'search_again') { await sleep(rand(1500, 2500)); return true; }
     return true;
-  }
-
-  /* ===================== 配置 ===================== */
-  const DEFAULTS = {
-    keywords: '运维工程师\n桌面运维\nIT支持',  // 每行一个职位关键词，按顺序搜索
-    include: '',          // 职位名必须包含其一(逗号分隔,留空不限)
-    exclude: '外包,销售,实习', // 职位名含其一则跳过
-    excludeCompany: '',   // 公司名含其一则跳过
-    minScore: 45,   // 岗位匹配度阈值(低于此分跳过)
-    max: 50,              // 本次最多投递数量
-    minDelay: 8,          // 每次投递最小间隔(秒)
-    maxDelay: 20,         // 每次投递最大间隔(秒)
-    maxFail: 3,           // 连续失败N条即熔断停止
-    cooldownMin: 30,      // 熔断后冷却(分钟)
-    aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
-    realClick: true,   // 合成点击无效时，升级系统级真实鼠标点击(需本地服务 127.0.0.1:8901)
-  };
-  const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
-
-  // 选择器集中放这里,BOSS 改版后只需改这里
-  const SEL = {
-    card: '.job-card-wrapper, .job-card-box, li.job-card-wrapper',
-    cardTitle: '.job-name, .job-title',
-    cardCompany: '.company-name, .boss-name',
-    detail: '.job-detail-box, .job-detail',
-    detailBox: '#job-detail, .job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap',
-    chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat, [ka*="job-detail-chat"], .job-detail-op .btn, .job-detail-container .btn-startchat, .job-detail-op .btn-startchat',
-    nextPage: '.options-pages a.next, .options-pages .next',
-    dialog: '.dialog-container, .greet-boss-dialog',
-    jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text',
-  };
-
-  /* ===================== 工具函数 ===================== */
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const rand = (a, b) => a + Math.random() * (b - a);
-  const list = (s) => s.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
-
-  async function waitFor(fn, timeout = 5000, step = 150) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      const v = fn();
-      if (v) return v;
-      await sleep(step);
-    }
-    return null;
   }
 
   /* ===================== 风控检测与熔断机制 ===================== */
@@ -288,7 +373,7 @@
   };
 
   function todayKey() { return new Date().toLocaleDateString(); }
-  
+
   function getLock() {
     const l = _gmGet('bag_lock', null);
     return l && l.until > Date.now() ? l : null;
@@ -349,17 +434,17 @@
     let ov = null;
     try { ov = [...document.querySelectorAll(RISK.overlay)].find(visible); } catch (e) {}
     if (ov) return '检测到验证类弹窗或滑块控件';
-    
+
     // 检查页面主体或弹窗中是否包含风控/频繁短语
     const bodyText = [...document.body.children].filter((c) => c !== panel).map(el => el.textContent || '').join('\n');
     const hit = RISK.phrases.find((p) => bodyText.includes(p));
     if (hit) return '页面出现风控/限制提示:' + hit;
-    
+
     return '';
   }
 
   function trip(reason, silent) {
-    running = false;
+    Task.set('NEEDS_HUMAN', reason);
     _gmSet('bag_hb', 0);
     _gmSet('bag_lock', { until: Date.now() + cfg.cooldownMin * 60000, reason, at: Date.now() });
     panel.style.borderColor = '#e55';
@@ -368,6 +453,97 @@
     updateStatus();
     $('bag-start').disabled = false;
     if (!silent) setTimeout(() => alert(`海投助手已安全熔断\n原因:${reason}\n已进入冷却期 ${cfg.cooldownMin} 分钟`), 50);
+  }
+
+  /* ============================================================
+   * 模块2：页面识别（P1）
+   * 先知道页面处于什么状态，再决定下一步做什么
+   * ============================================================ */
+  function detectPage() {
+    if (RISK.url.test(location.pathname + location.search)) return { type: 'verify', detail: location.pathname };
+    if (RISK.title.test(document.title)) return { type: 'verify', detail: document.title };
+    let ov = null;
+    try { ov = [...document.querySelectorAll(RISK.overlay)].find(visible); } catch (e) {}
+    if (ov) return { type: 'captcha', detail: String(ov.className || ov.tagName).slice(0, 40) };
+    const hasCard = !!document.querySelector(SEL.card);
+    const bodyHead = (document.body.innerText || '').slice(0, 2000);
+    if (!hasCard && /扫码登录|请先登录|登录后查看|登录已过期/.test(bodyHead)) return { type: 'login' };
+    if (document.readyState !== 'complete') return { type: 'loading' };
+    if (hasCard) return { type: 'list', detail: document.querySelectorAll(SEL.card).length + '张卡片' };
+    if ([...document.querySelectorAll(SEL.detailBox)].some(visible)) return { type: 'detail' };
+    return { type: 'unknown' };
+  }
+
+  /* ============================================================
+   * 模块3：元素定位辅助（P2）
+   * 定位后检查：存在/可见/禁用/遮挡/位置尺寸，全部入日志
+   * ============================================================ */
+  function elInfo(el) {
+    const r = el.getBoundingClientRect();
+    let occluded = false;
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    if (cx >= 0 && cy >= 0 && cx <= window.innerWidth && cy <= window.innerHeight) {
+      const top = document.elementFromPoint(cx, cy);
+      occluded = !!(top && top !== el && !el.contains(top) && !top.contains(el));
+    }
+    return {
+      tag: el.tagName.toLowerCase(),
+      cls: String(el.className || '').trim().slice(0, 50),
+      text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24),
+      rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+      visible: el.getClientRects().length > 0,
+      disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true' || /disabled/.test(String(el.className || ''))),
+      occluded,
+    };
+  }
+
+  /* ============================================================
+   * 模块4：交互执行 + 模块5：结果验证（P3）
+   * 操作分两阶段：执行（合成点击→系统级点击兜底）与验证（DOM/弹窗/指纹变化）
+   * 没有验证通过,一律记为失败,绝不把"点了"当"成了"
+   * ============================================================ */
+  async function doAction(opts) {
+    const { name, find, verify, timeout = 4000, sys = true, verifyDesc = '' } = opts;
+    const safeVerify = () => { try { return verify(); } catch (e) { return null; } };
+    const urlBefore = location.href;
+
+    // 定位（含短暂等待,元素可能是异步渲染的）
+    const el = await waitFor(() => { const e = find(); return e && e.getClientRects && e.getClientRects().length ? e : null; }, 2500, 150);
+    if (!el) {
+      alog('ACTION_FAILED', `${name}:元素未找到`, { action_type: 'LOCATE', target: name, result: 'not_found' });
+      return { ok: false, error: 'not_found' };
+    }
+    const info = elInfo(el);
+    alog('ELEMENT_FOUND', `${name}:<${info.tag}>「${info.text}」可见=${info.visible} 遮挡=${info.occluded} 禁用=${info.disabled} rect=(${info.rect.x},${info.rect.y},${info.rect.w}x${info.rect.h})`,
+      { action_type: 'LOCATE', target: name, element: info });
+    if (info.disabled) {
+      alog('ACTION_FAILED', `${name}:元素被禁用`, { action_type: 'CLICK', target: name, result: 'disabled', element: info });
+      return { ok: false, error: 'disabled', el };
+    }
+
+    // 执行：先合成点击
+    alog('CLICK_ATTEMPT', `${name}:合成点击`, { action_type: 'CLICK', target: name, execution_method: 'synthetic', url_before: urlBefore });
+    humanClick(el);
+    let ok = await waitFor(safeVerify, timeout, 150);
+    let method = 'synthetic';
+
+    // 验证失败 → 升级系统级真实点击
+    if (!ok && sys && cfg.realClick) {
+      alog('CLICK_ATTEMPT', `${name}:合成点击未通过验证,升级系统级点击`, { action_type: 'CLICK', target: name, execution_method: 'system' });
+      if (await sysClick(el, name)) {
+        method = 'system';
+        ok = await waitFor(safeVerify, timeout, 150);
+      }
+    }
+
+    if (ok) {
+      alog('ACTION_SUCCESS', `${name}:验证通过(${method}${verifyDesc ? ',' + verifyDesc : ''})`,
+        { action_type: 'CLICK', target: name, execution_method: method, result: 'success', state_changed: true, url_after: location.href });
+    } else {
+      alog('ACTION_TIMEOUT', `${name}:执行后未检测到预期变化(${method})`,
+        { action_type: 'CLICK', target: name, execution_method: method, result: 'timeout', state_changed: false, url_after: location.href });
+    }
+    return { ok, el, method };
   }
 
   /* ===================== UI 界面 ===================== */
@@ -384,6 +560,7 @@
       font:inherit;resize:vertical}
     #bag-panel .row{display:flex;gap:6px}
     #bag-panel button{flex:1;margin-top:8px;padding:5px;border:0;border-radius:4px;color:#fff;cursor:pointer}
+    #bag-panel button:disabled{opacity:.5;cursor:not-allowed}
     #bag-start{background:#00bebd}#bag-stop{background:#e55}#bag-unlock{background:#888}
     #bag-count{margin-top:6px;font-weight:600;color:#00bebd}
     #bag-log{margin-top:8px;height:120px;overflow:auto;background:#f6f6f6;border-radius:4px;padding:4px 6px;
@@ -393,7 +570,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手(安全增强版)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.0(可观测版)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限)</label><input id="bag-include">
@@ -421,16 +598,19 @@
       <label>API Key（仅存本地）</label><input id="bag-aiKey" type="password" autocomplete="off">
       <div class="row">
         <button id="bag-start">开始投递</button>
+        <button id="bag-pause" style="background:#e8a33d">暂停</button>
         <button id="bag-stop">停止</button>
       </div>
       <div class="row">
         <button id="bag-unlock" style="background:#888; margin-top:4px;">解除冷却(已手动处理)</button>
       </div>
       <div class="row">
-        <button id="bag-diag" style="background:#00bebd; margin-top:4px;">界面自检(不点也不改页面)</button>
+        <button id="bag-diag" style="background:#00bebd; margin-top:4px;">界面自检</button>
+        <button id="bag-test" style="background:#e8a33d; margin-top:4px;">单卡闭环测试</button>
       </div>
       <div class="row">
-        <button id="bag-test" style="background:#e8a33d; margin-top:4px;">测试点一次(只点当前岗位)</button>
+        <button id="bag-exportlog" style="background:#36c; margin-top:4px;">导出诊断日志</button>
+        <button id="bag-exportjobs" style="background:#36c; margin-top:4px;">导出岗位CSV</button>
       </div>
       <div id="bag-count"></div>
       <div id="bag-log"></div>
@@ -462,15 +642,21 @@
 
   function updateStatus() {
     const l = getLock();
-    $('bag-count').textContent = l 
-      ? `⛔ 冷却中,剩余约${Math.ceil((l.until - Date.now()) / 60000)}分钟` 
-      : `状态: 就绪`;
+    const pauseBtn = $('bag-pause');
+    if (pauseBtn) {
+      pauseBtn.textContent = Task.state === 'PAUSED' ? '继续' : '暂停';
+      pauseBtn.disabled = !Task.working;
+    }
+    $('bag-count').textContent = l
+      ? `⛔ 冷却中,剩余约${Math.ceil((l.until - Date.now()) / 60000)}分钟`
+      : `状态:${STATE_NAMES[Task.state] || Task.state}｜日志 ${Logger.size()}条`;
   }
   updateStatus();
   setInterval(updateStatus, 30000);
 
   function log(msg) {
     const box = $('bag-log');
+    if (!box) return;
     const t = new Date().toTimeString().slice(0, 8);
     box.textContent += `[${t}] ${msg}\n`;
     box.scrollTop = box.scrollHeight;
@@ -495,7 +681,6 @@
   }
 
   /* ===================== 核心逻辑 ===================== */
-  let running = false;
   const seen = new Set();
   let sent = 0;
 
@@ -670,20 +855,6 @@
     return cand.el;
   }
 
-  // AI 辅助找「立即沟通」：常规 → AI
-  async function findChatBtnWithAI(card) {
-    const normal = findChatBtn(card);
-    if (normal) return normal;
-    return await aiLocateButton('chat');
-  }
-
-  // AI 辅助找「留在此页」：常规 → AI（弹窗是动态的，不用缓存）
-  async function findStayBtnWithAI() {
-    const normal = findStayBtn();
-    if (normal) return normal;
-    return await aiLocateButton('stay');
-  }
-
   function clickStay(btn) {
     ['mousedown', 'mouseup', 'click'].forEach((type) =>
       btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
@@ -725,11 +896,21 @@
     await sleep(rand(250, 450));
     const titleEl = card.querySelector(SEL.cardTitle);
     humanClick(titleEl || card);
-    if (await waitFor(switched, 2800, 150)) return true;
+    if (await waitFor(switched, 2800, 150)) {
+      alog('DETAIL_DETECTED', '详情区已切换(指纹变化)', { action_type: 'CLICK', target: '岗位卡片', result: 'success', state_changed: true });
+      return true;
+    }
     humanClick(card);
-    if (await waitFor(switched, 2800, 150)) return true;
+    if (await waitFor(switched, 2800, 150)) {
+      alog('DETAIL_DETECTED', '详情区已切换(第二次点击)', { action_type: 'CLICK', target: '岗位卡片', result: 'success', state_changed: true });
+      return true;
+    }
     // 指纹没变但页面本来就有 JD（首个岗位默认已展开），也算可用
-    return hasJd();
+    const ok = hasJd();
+    alog(ok ? 'DETAIL_DETECTED' : 'DETAIL_TIMEOUT',
+      ok ? '详情区已有JD(首岗默认展开)' : '详情区未检测到JD',
+      { action_type: 'CLICK', target: '岗位卡片', result: ok ? 'success' : 'timeout', state_changed: detailFingerprint() !== before });
+    return ok;
   }
 
   // 找「立即沟通」按钮：详情容器 → 整页 → 当前卡片内，共三级兜底
@@ -770,16 +951,22 @@
   // 点「留在此页」关掉弹窗；true=已清空，false=关不掉
   async function closeDialog() {
     for (let i = 0; i < 3; i++) {
-      const btn = await waitFor(findStayBtnWithAI, 2500, 100);
+      const btn = await waitFor(() => findStayBtn(), 2500, 100);
       if (btn) {
         clickStay(btn);
-        log('已点击"留在此页"');
+        alog('CLICK_ATTEMPT', '弹窗:点击「留在此页」', { action_type: 'CLICK', target: '留在此页', execution_method: 'synthetic', element: elInfo(btn) });
         await sleep(rand(400, 700));
-        if (await waitDialogGone(1500)) return true;
+        if (await waitDialogGone(1500)) {
+          alog('ACTION_SUCCESS', '弹窗已关闭(留在此页)', { action_type: 'CLICK', target: '留在此页', result: 'success', state_changed: true });
+          return true;
+        }
         // 合成点击关不掉弹窗 → 升级系统级真实点击
         if (await sysClick(btn, '留在此页')) {
           await sleep(rand(400, 700));
-          if (await waitDialogGone(1500)) return true;
+          if (await waitDialogGone(1500)) {
+            alog('ACTION_SUCCESS', '弹窗已关闭(系统级点击)', { action_type: 'CLICK', target: '留在此页', execution_method: 'system', result: 'success', state_changed: true });
+            return true;
+          }
         }
         continue;
       }
@@ -808,6 +995,7 @@
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true }));
     await sleep(500);
     if (await waitDialogGone(1200)) return true;
+    alog('ACTION_FAILED', '弹窗无法关闭,已终止', { action_type: 'CLICK', target: '关闭弹窗', result: 'timeout' });
     log('⚠ 弹窗无法关闭，为避免误点已终止');
     return false;
   }
@@ -868,7 +1056,7 @@
   // 突变监听：发现阻断弹窗自动点留在此页
   let lastStayClick = 0;
   new MutationObserver(() => {
-    if (!running) return;
+    if (!Task.active) return;
     if (Date.now() - lastStayClick < 1500) return;
     const btn = findStayBtn();
     if (btn) {
@@ -877,13 +1065,112 @@
     }
   }).observe(document.body, { childList: true, subtree: true });
 
+  /* ============================================================
+   * 模块6：岗位数据管理（P4）
+   * IndexedDB 存岗位记录(按 key 去重),可导出 CSV；IDB 不可用时回退 GM
+   * ============================================================ */
+  const JobStore = (() => {
+    let dbp = null;
+    function open() {
+      if (dbp) return dbp;
+      dbp = new Promise((res) => {
+        let rq;
+        try { rq = indexedDB.open('boss_helper', 1); } catch (e) { return res(null); }
+        rq.onupgradeneeded = () => {
+          const db = rq.result;
+          if (!db.objectStoreNames.contains('jobs')) db.createObjectStore('jobs', { keyPath: 'key' });
+        };
+        rq.onsuccess = () => res(rq.result);
+        rq.onerror = () => res(null);
+      });
+      return dbp;
+    }
+    async function put(job) {
+      const db = await open();
+      if (!db) {
+        const arr = _gmGet('job_store', []);
+        const i = arr.findIndex((j) => j.key === job.key);
+        if (i >= 0) arr[i] = job; else arr.push(job);
+        _gmSet('job_store', arr.slice(-1000));
+        return true;
+      }
+      return new Promise((res) => {
+        try {
+          const tx = db.transaction('jobs', 'readwrite');
+          tx.objectStore('jobs').put(job);
+          tx.oncomplete = () => res(true);
+          tx.onerror = () => res(false);
+        } catch (e) { res(false); }
+      });
+    }
+    async function all() {
+      const db = await open();
+      if (!db) return _gmGet('job_store', []);
+      return new Promise((res) => {
+        try {
+          const rq = db.transaction('jobs', 'readonly').objectStore('jobs').getAll();
+          rq.onsuccess = () => res(rq.result || []);
+          rq.onerror = () => res([]);
+        } catch (e) { res([]); }
+      });
+    }
+    async function exportCsv() {
+      const rows = await all();
+      const head = ['岗位', '公司', '薪资', '地区', '匹配度', '状态', '时间', '链接'];
+      const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+      const lines = [head.join(',')].concat(
+        rows.map((j) => [j.title, j.company, j.salary, j.area, j.score, j.status, j.ts, j.url].map(esc).join(','))
+      );
+      const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'boss-jobs-' + new Date().toISOString().slice(0, 10) + '.csv';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      return rows.length;
+    }
+    return { put, all, exportCsv };
+  })();
+
+  // 卡片去重键（DOM 节点会重渲染，用字符串键）
+  function cardKey(card) {
+    const a = card.querySelector('a[href*="/job_detail/"]');
+    const href = a ? a.getAttribute('href') : '';
+    const t = (card.querySelector(SEL.cardTitle)?.textContent || '').trim();
+    const c = (card.querySelector(SEL.cardCompany)?.textContent || '').trim();
+    return href || (t + '|' + c);
+  }
+
+  // 提取一条岗位记录（P4）
+  function extractJob(card, meta) {
+    const q = (sel) => (card.querySelector(sel)?.textContent || '').trim();
+    const jdEl = [...document.querySelectorAll(SEL.jdText)]
+      .find((el) => visible(el) && (el.textContent || '').trim().length > 10);
+    const a = card.querySelector('a[href*="/job_detail/"]');
+    return {
+      key: cardKey(card),
+      title: q(SEL.cardTitle),
+      company: q(SEL.cardCompany),
+      salary: q('.salary'),
+      area: q('.job-area'),
+      jd: jdEl ? (jdEl.textContent || '').trim().slice(0, 800) : '',
+      url: a ? a.href : '',
+      score: meta && meta.score != null ? meta.score : null,
+      reason: (meta && meta.reason) || '',
+      status: (meta && meta.status) || 'seen',
+      ts: new Date().toISOString(),
+    };
+  }
+
   async function processCard(card) {
+    await checkpoint();
     const title = (card.querySelector(SEL.cardTitle)?.textContent || '').trim();
     const company = (card.querySelector(SEL.cardCompany)?.textContent || '').trim();
 
     const reason = passFilter(title, company);
     if (reason) {
       log(`跳过:${title} @ ${company}(${reason})`);
+      await JobStore.put(extractJob(card, { status: 'skipped', reason }));
       return 'skip';
     }
 
@@ -922,6 +1209,7 @@
     const hit = HARD_BLOCK.find((k) => (title + company + (jdEl ? jdEl.textContent : '')).includes(k));
     if (hit) {
       log('跳过(硬性排除:' + hit + '):' + title + ' @ ' + company);
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: '硬性排除:' + hit }));
       return 'skip';
     }
 
@@ -933,32 +1221,40 @@
     }
     if (score == null) { const r = scoreJob(jobText, title); score = r.score; hits = r.hits; }
     const threshold = cfg.aiEnabled ? Number(cfg.aiThreshold || 60) : Number(cfg.minScore || 45);
-    if (score < threshold) { log(`跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`); return 'skip'; }
-    log(`匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`);
+    if (score < threshold) {
+      log(`跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`);
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score }));
+      return 'skip';
+    }
+    alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
+      { action_type: 'SCORE', target: title + ' @ ' + company, score, reason: why || hits.slice(0, 6).join('/') });
 
-    const btn = await waitFor(() => findChatBtnWithAI(card), 4000);
+    // 定位「立即沟通」：常规三级 → AI 兜底
+    let btn = await waitFor(() => findChatBtn(card), 3000);
+    if (!btn) btn = await aiLocateButton('chat');
     if (!btn) {
-      log(`未找到沟通按钮:${title}｜详情面板${opened ? '已打开' : '未打开'}`);
+      alog('ACTION_FAILED', `未找到沟通按钮:${title}`, { action_type: 'LOCATE', target: '立即沟通', result: 'not_found' });
       logChatCandidates();
       return 'fail';
     }
     const text = btn.textContent.trim();
     if (!/立即沟通|马上沟通|打招呼/.test(text)) {
       log(`已沟通过,跳过:${title} @ ${company}`);
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: '已沟通过', score }));
       return 'skip';
     }
 
-    log(`点击沟通按钮:"${text}"(${btn.className || btn.tagName})`);
-    humanClick(btn);
-    // 等「留在此页」弹窗出现（最多 4 秒），出现后立即处理
-    let dialogShown = await waitFor(anyDialog, 4000, 120);
-    if (!dialogShown) {
-      // 合成点击没弹出窗口 → 升级系统级真实鼠标点击重试一次
-      log('合成点击未弹窗,尝试系统级真实点击…');
-      if (await sysClick(btn, '立即沟通')) {
-        dialogShown = await waitFor(anyDialog, 4000, 120);
-      }
-      if (!dialogShown) log('真实点击后仍无弹窗,按失败处理');
+    // 执行点击 + 验证弹窗（doAction:定位检查→合成点击→验证→系统级兜底→结构化日志）
+    const clickRes = await doAction({
+      name: '立即沟通',
+      find: () => (isShown(btn) ? btn : findChatBtn(card)),
+      verify: () => anyDialog(),
+      timeout: 4000,
+      verifyDesc: '弹窗出现',
+    });
+    if (!clickRes.ok) {
+      await JobStore.put(extractJob(card, { status: 'click_failed', score }));
+      return 'fail';
     }
 
     // 投递后再次严格检测是否触发风控限制
@@ -972,7 +1268,9 @@
     await sleep(rand(600, 1000));
     const resumeSent = await sendResumeAttachment();
     sent++;
-    log(`✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`);
+    alog('JOB_SENT', `✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`,
+      { action_type: 'SEND', target: title + ' @ ' + company, result: 'success', score });
+    await JobStore.put(extractJob(card, { status: 'sent', score, reason: why }));
     return 'ok';
   }
 
@@ -988,8 +1286,12 @@
 
   // 在搜索框输入关键词并回车，等待列表刷新
   async function doSearch(kw) {
+    alog('ACTION_ATTEMPT', `搜索「${kw}」`, { action_type: 'INPUT', target: '搜索框', value: kw });
     const box = await waitFor(() => [...document.querySelectorAll(SEARCH_SEL)].find(visible), 8000, 200);
-    if (!box) { log('未找到搜索框'); return false; }
+    if (!box) {
+      alog('ACTION_FAILED', '未找到搜索框', { action_type: 'INPUT', target: '搜索框', result: 'not_found' });
+      return false;
+    }
     box.focus();
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
     setter.call(box, kw);
@@ -1002,17 +1304,10 @@
     const before = firstCardKey();
     const changed = await waitFor(() => { const k = firstCardKey(); return k && k !== before; }, 12000, 300);
     await sleep(rand(1200, 2000));
-    log(changed ? `已搜索「${kw}」` : `未检测到列表刷新:「${kw}」`);
+    alog(changed ? 'ACTION_SUCCESS' : 'ACTION_TIMEOUT',
+      changed ? `已搜索「${kw}」` : `未检测到列表刷新:「${kw}」`,
+      { action_type: 'INPUT', target: '搜索框', result: changed ? 'success' : 'timeout', state_changed: !!changed });
     return true;
-  }
-
-  // 卡片去重键（DOM 节点会重渲染，用字符串键）
-  function cardKey(card) {
-    const a = card.querySelector('a[href*="/job_detail/"]');
-    const href = a ? a.getAttribute('href') : '';
-    const t = (card.querySelector(SEL.cardTitle)?.textContent || '').trim();
-    const c = (card.querySelector(SEL.cardCompany)?.textContent || '').trim();
-    return href || (t + '|' + c);
   }
 
   async function loadMore() {
@@ -1021,7 +1316,9 @@
     const listEl = document.querySelector(SEL.card)?.closest('.job-list-box, .job-list-container, .job-list') || document.querySelector(SEL.card)?.parentElement;
     if (listEl) listEl.scrollTop = listEl.scrollHeight;
     await sleep(rand(1500, 2500));
-    if (document.querySelectorAll(SEL.card).length > before) return true;
+    const after = document.querySelectorAll(SEL.card).length;
+    alog('SCROLL', `滚动加载:卡片 ${before} → ${after}`, { action_type: 'SCROLL', target: '岗位列表', state_changed: after > before });
+    if (after > before) return true;
 
     const next = document.querySelector(SEL.nextPage);
     if (next && !/disabled/.test(next.className)) {
@@ -1038,6 +1335,8 @@
     const q = (s) => [...document.querySelectorAll(s)];
     const vis = (e) => !!e.getClientRects().length;
     log('===== 界面自检开始 =====');
+    const pg = detectPage();
+    log(`自检:页面类型 = ${pg.type}${pg.detail ? ' (' + pg.detail + ')' : ''}`);
     Object.keys(SEL).forEach((k) => {
       const els = q(SEL[k]);
       log(`自检:${k} = ${els.length} (可见 ${els.filter(vis).length})`);
@@ -1053,44 +1352,100 @@
     log(`自检:页面含"留在此页" = ${/留在此页/.test(bodyText)}`);
     log(`自检:页面含"验证/滑块/频繁" = ${/验证|滑块|过于频繁/.test(bodyText)}`);
     log(`自检:当前URL = ${location.href.slice(0, 80)}`);
-    const blocked = /^立即沟通$/.test(bodyText.slice(0, 3));
     log(`自检:AI已启用 = ${cfg.aiEnabled}, Key已填 = ${!!_gmGet('aiKey', '')}`);
-    if (blocked) log('自检:警告-页面疑似异常');
     log('===== 界面自检结束 =====');
   }
 
-  // 单点测试：只针对当前右侧详情，点一次「立即沟通」并观察弹窗，用于定位卡点
-  async function testOne() {
-    log('===== 单点测试开始 =====');
-    const btn = findChatBtn(document.querySelector(SEL.card));
-    if (!btn) {
-      log('测试:未找到「立即沟通」按钮，先输出界面结构');
-      runDiag();
-      return;
+  /* ============================================================
+   * 单卡闭环测试（P0~P4 验收入口）
+   * 定位第一张卡片 → 点开详情并验证 → 提取岗位记录存库 →
+   * 点击立即沟通并验证弹窗 → 点留在此页并验证弹窗关闭 → 全程结构化日志
+   * ============================================================ */
+  async function testLoop() {
+    if (Task.working) { log('任务运行中,请先停止再测试'); return; }
+    log('===== 单卡闭环测试开始 =====');
+    Logger.newTask({ mode: 'single_card_test' });
+    try {
+      // 1) 页面识别
+      const pg = detectPage();
+      alog('PAGE_DETECTED', `页面类型:${pg.type}${pg.detail ? '(' + pg.detail + ')' : ''}`, { page: pg });
+      if (pg.type === 'verify' || pg.type === 'captcha' || pg.type === 'login') {
+        log('页面状态不允许测试(需登录/验证),请先人工处理');
+        return;
+      }
+
+      // 2) 定位第一张岗位卡片
+      const card = await waitFor(() => document.querySelector(SEL.card), 5000, 200);
+      if (!card) {
+        alog('ACTION_FAILED', '未找到岗位卡片', { action_type: 'LOCATE', target: '岗位卡片', result: 'not_found' });
+        return;
+      }
+      alog('ELEMENT_FOUND', `岗位卡片:${(card.querySelector(SEL.cardTitle)?.textContent || '').trim()}`,
+        { action_type: 'LOCATE', target: '岗位卡片', element: elInfo(card) });
+
+      // 3) 打开详情 + 验证详情切换
+      const fpBefore = detailFingerprint();
+      const okOpen = await openDetail(card);
+      if (!okOpen) {
+        log('闭环测试:详情区未能加载,请导出日志');
+        return;
+      }
+      alog('PAGE_STATE', `详情指纹:${fpBefore.slice(0, 30)} → ${detailFingerprint().slice(0, 30)}`,
+        { state_changed: detailFingerprint() !== fpBefore });
+
+      // 4) 数据提取 + 存库
+      const job = extractJob(card, { status: 'test' });
+      await JobStore.put(job);
+      alog('DATA_EXTRACTED', `提取岗位:${job.title} @ ${job.company}｜薪资:${job.salary || '-'}｜地区:${job.area || '-'}｜JD:${job.jd.length}字`,
+        { action_type: 'EXTRACT', target: job.title, job: { key: job.key, title: job.title, company: job.company, salary: job.salary, area: job.area, jd_len: job.jd.length } });
+
+      // 5) 定位 + 点击「立即沟通」+ 验证弹窗出现
+      let btn = findChatBtn(card);
+      if (!btn) btn = await aiLocateButton('chat');
+      if (!btn) {
+        alog('ACTION_FAILED', '立即沟通按钮定位失败', { action_type: 'LOCATE', target: '立即沟通', result: 'not_found' });
+        logChatCandidates();
+        return;
+      }
+      const chatBtn = btn;
+      const r1 = await doAction({
+        name: '立即沟通',
+        find: () => (isShown(chatBtn) ? chatBtn : findChatBtn(card)),
+        verify: () => anyDialog(),
+        timeout: 4000,
+        verifyDesc: '弹窗出现',
+      });
+      if (!r1.ok) {
+        log('闭环测试:沟通按钮点击未通过验证,请导出日志分析');
+        return;
+      }
+
+      // 6) 点击「留在此页」+ 验证弹窗关闭
+      const stay = await waitFor(() => findStayBtn(), 3000, 150);
+      if (stay) {
+        const r2 = await doAction({
+          name: '留在此页',
+          find: () => (isShown(stay) ? stay : findStayBtn()),
+          verify: () => !anyDialog(),
+          timeout: 2000,
+          verifyDesc: '弹窗关闭',
+        });
+        if (!r2.ok) await closeDialog();
+      } else {
+        alog('ELEMENT_NOT_FOUND', '弹窗中未找到「留在此页」,走通用关弹窗流程', { action_type: 'LOCATE', target: '留在此页', result: 'not_found' });
+        await closeDialog();
+      }
+      log('===== 单卡闭环测试结束(点「导出诊断日志」查看完整记录) =====');
+    } finally {
+      Logger.endTask('test_done');
     }
-    const bcls = String(btn.className || '').trim().slice(0, 40);
-    log(`测试:找到按钮 <${btn.tagName.toLowerCase()} class="${bcls}">「${(btn.textContent || '').trim()}」`);
-    btn.click();
-    log('测试:已派发点击,等待弹窗…');
-    const stay = await waitFor(() => findStayBtn(), 6000, 200);
-    if (stay) {
-      const scls = String(stay.className || '').trim().slice(0, 40);
-      log(`测试:出现「留在此页」 <${stay.tagName.toLowerCase()} class="${scls}">`);
-      stay.click();
-      await sleep(rand(700, 1100));
-      log(`测试:已点击留在此页,弹窗是否仍在 = ${anyDialog()}`);
-    } else {
-      log('测试:点击后未出现「留在此页」弹窗');
-      log(`测试:页面含"留在此页" = ${/留在此页/.test(document.body.innerText)}`);
-      log(`测试:当前是否有弹窗 = ${anyDialog()}`);
-    }
-    log('===== 单点测试结束 =====');
   }
 
   // 单个关键词：从第一张卡到最后一张，滚动加载直到无新增
   async function runKeyword(kw) {
     let idx = 0, emptyRounds = 0, failStreak = 0, aiTries = 0;
-    while (running) {
+    while (Task.working) {
+      await checkpoint();
       _gmSet('bag_hb', Date.now());
 
       const r = detectRisk();
@@ -1114,7 +1469,7 @@
         const more = await loadMore();
         if (!more) {
           const act = aiTries < 3 ? (aiTries++, await aiDecide('滚动加载后没有新岗位', { kw, idx })) : null;
-          if (act === 'abort') { running = false; return; }
+          if (act === 'abort') { Task.set('STOPPED', 'AI判定'); return; }
           if (act === 'search_again') return;
           if (act === 'scroll_bottom') { await loadMore(); continue; }
           if (++emptyRounds >= 2) { log(`「${kw}」已无新岗位，共 ${idx} 个`); return; }
@@ -1135,12 +1490,15 @@
 
       let st = 'skip';
       try { st = await processCard(card); }
-      catch (e) { log('出错:' + e.message); st = 'fail'; }
+      catch (e) {
+        if (e && e.name === 'StopError') throw e;
+        log('出错:' + e.message); st = 'fail';
+      }
 
       if (st === 'halt') return;
       if (st === 'ok') {
         failStreak = 0;
-        await sleep(rand(cfg.minDelay, cfg.maxDelay) * 1000);
+        await pauseableSleep(rand(cfg.minDelay, cfg.maxDelay) * 1000);
       } else if (st === 'fail') {
         if (++failStreak >= cfg.maxFail) {
           const act = await aiDecide('连续失败', { kw, failStreak });
@@ -1165,49 +1523,82 @@
     const kws = String(cfg.keywords || '').split(/\r?\n|,|，/).map((s) => s.trim()).filter(Boolean);
     if (!kws.length) { log('请先填写职位关键词'); return; }
 
-    running = true;
+    Logger.newTask({ keywords: kws, max: cfg.max, aiEnabled: cfg.aiEnabled });
+    const pg = detectPage();
+    alog('PAGE_DETECTED', `页面类型:${pg.type}${pg.detail ? '(' + pg.detail + ')' : ''}`, { page: pg });
+
     sent = 0;
     seen.clear();
     $('bag-start').disabled = true;
     panel.style.borderColor = '#00bebd';
+    Task.set('RUNNING', '任务启动');
     log(`开始运行：${kws.length} 个关键词，上限 ${cfg.max} 个投递`);
 
-    for (let i = 0; i < kws.length && running && sent < cfg.max; i++) {
-      const kw = kws[i];
-      log(`=== (${i + 1}/${kws.length}) 搜索「${kw}」 ===`);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-      await sleep(rand(600, 1000));
+    try {
+      for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
+        await checkpoint();
+        const kw = kws[i];
+        log(`=== (${i + 1}/${kws.length}) 搜索「${kw}」 ===`);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        await sleep(rand(600, 1000));
 
-      let okSearch = await doSearch(kw);
-      if (!okSearch) {
-        const act = await aiDecide('找不到搜索框', { kw });
-        if (act === 'abort') break;
-        if (act === 'close_dialog') await closeDialog();
-        if (act === 'scroll_top') window.scrollTo({ top: 0, behavior: 'smooth' });
-        await sleep(rand(1500, 2500));
-        okSearch = await doSearch(kw);
-        if (!okSearch) { log('搜索失败，程序停止'); break; }
+        let okSearch = await doSearch(kw);
+        if (!okSearch) {
+          const act = await aiDecide('找不到搜索框', { kw });
+          if (act === 'abort') break;
+          if (act === 'close_dialog') await closeDialog();
+          if (act === 'scroll_top') window.scrollTo({ top: 0, behavior: 'smooth' });
+          await sleep(rand(1500, 2500));
+          okSearch = await doSearch(kw);
+          if (!okSearch) { log('搜索失败，程序停止'); break; }
+        }
+
+        await runKeyword(kw);
+        if (!Task.working) break;
+        log(`「${kw}」处理完成，累计投递 ${sent} 个`);
       }
-
-      await runKeyword(kw);
-      if (!running) break;
-      log(`「${kw}」处理完成，累计投递 ${sent} 个`);
+      if (Task.working) Task.set('COMPLETED', `投递${sent}个`);
+    } catch (e) {
+      if (e && e.name === 'StopError') {
+        log('已停止');
+      } else {
+        log('任务异常:' + e.message);
+        Task.set('FAILED', e.message);
+      }
     }
 
-    running = false;
+    Logger.endTask(Task.state, { sent });
     _gmSet('bag_hb', 0);
     $('bag-start').disabled = false;
+    updateStatus();
     log(`结束，本次共投递 ${sent} 个`);
   }
 
   /* ===================== 按钮绑定 ===================== */
-  $('bag-start').onclick = () => !running && run();
+  $('bag-start').onclick = () => !Task.working && run();
+  $('bag-pause').onclick = () => {
+    if (Task.state === 'PAUSED') {
+      Task.set('RUNNING', '手动继续');
+      log('已继续');
+    } else if (Task.active) {
+      Task.set('PAUSED', '手动暂停');
+      log('已暂停,点击「继续」恢复');
+    }
+  };
   $('bag-stop').onclick = () => {
-    if (running) log('正在手动停止…');
-    running = false;
+    if (Task.working) log('正在手动停止…');
+    Task.set('STOPPED', '手动停止');
   };
   $('bag-diag').onclick = () => runDiag();
-  $('bag-test').onclick = () => testOne();
+  $('bag-test').onclick = () => testLoop();
+  $('bag-exportlog').onclick = () => {
+    const n = Logger.exportFile();
+    log(`已导出诊断日志 JSON(${n} 条)`);
+  };
+  $('bag-exportjobs').onclick = async () => {
+    const n = await JobStore.exportCsv();
+    log(`已导出岗位数据 CSV(${n} 条)`);
+  };
   $('bag-unlock').onclick = () => {
     const l = _gmGet('bag_lock', null);
     if (!l || l.until <= Date.now()) return log('当前没有处于冷却中');
