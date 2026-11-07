@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.3.0
+// @version      1.3.1
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -60,7 +60,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v1.3.0 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.3.1 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -188,10 +188,11 @@
 
   // 选择器集中放这里,BOSS 改版后只需改这里
   const SEL = {
-    card: '.job-card-wrapper, .job-card-box',
+    card: '.job-card-wrapper, .job-card-box, li.job-card-wrapper',
     cardTitle: '.job-name, .job-title',
     cardCompany: '.company-name, .boss-name',
     detail: '.job-detail-box, .job-detail',
+    detailBox: '#job-detail, .job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap',
     chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat',
     nextPage: '.options-pages a.next, .options-pages .next',
     dialog: '.dialog-container, .greet-boss-dialog',
@@ -415,6 +416,49 @@
     );
   }
 
+  // 按文案找按钮：忽略空白、限制字数、校验可见与尺寸
+  function btnByText(root, re) {
+    return [...root.querySelectorAll('a, button, span, div')].find((el) => {
+      if (!visible(el)) return false;
+      const t = (el.textContent || '').replace(/\s+/g, '');
+      if (t.length > 8 || !re.test(t)) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 30 && r.height > 20;
+    }) || null;
+  }
+
+  // 打开岗位详情：先点标题，再兜底整卡点击
+  async function openDetail(card) {
+    const hasJd = () => [...document.querySelectorAll(SEL.jdText)]
+      .some((el) => visible(el) && (el.textContent || '').trim().length > 30);
+    card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await sleep(rand(400, 700));
+    const titleEl = card.querySelector(SEL.cardTitle);
+    (titleEl || card).click();
+    await sleep(rand(700, 1100));
+    if (await waitFor(hasJd, 2200, 150)) return true;
+    card.click();
+    await sleep(rand(600, 900));
+    if (await waitFor(hasJd, 2500, 150)) return true;
+    return false;
+  }
+
+  // 找「立即沟通」按钮：详情容器 → 整页 → 当前卡片内，共三级兜底
+  function findChatBtn(card) {
+    const boxes = [...document.querySelectorAll(SEL.detailBox)].filter(visible);
+    for (const b of boxes) {
+      const el = b.querySelector(SEL.chatBtn) || btnByText(b, /^立即沟通$/);
+      if (el) return el;
+    }
+    const loose = btnByText(document.body, /^立即沟通$/);
+    if (loose && !loose.closest(SEL.card)) return loose;
+    if (card) {
+      const inCard = card.querySelector(SEL.chatBtn) || btnByText(card, /^立即沟通$/);
+      if (inCard) return inCard;
+    }
+    return null;
+  }
+
   function anyDialog() {
     return [...document.querySelectorAll(SEL.dialog)].find(isShown) || null;
   }
@@ -534,16 +578,11 @@
       return 'halt';
     }
 
-    card.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    await sleep(rand(500, 900));
-    card.click(); // 加载详情
-    await sleep(rand(800, 1400));
-
-    // 读取岗位描述正文，和简历画像做相似度匹配
-    const jdEl = await waitFor(() => {
-      const el = [...document.querySelectorAll(SEL.jdText)].find(visible);
-      return el && (el.textContent || '').trim().length > 30 ? el : null;
-    }, 4000);
+    const opened = await openDetail(card);
+    const jdEl = opened
+      ? [...document.querySelectorAll(SEL.jdText)].find((el) => visible(el) && (el.textContent || '').trim().length > 30) || null
+      : null;
+    if (!jdEl) log(`未读到JD，改按标题与卡片标签打分:${title}`);
 
     const jobText = `${title} ${card.textContent || ''} ${jdEl ? jdEl.textContent : ''}`;
 
@@ -565,9 +604,9 @@
     if (score < threshold) { log(`跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`); return 'skip'; }
     log(`匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`);
 
-    const btn = await waitFor(() => document.querySelector(SEL.chatBtn), 4000);
+    const btn = await waitFor(() => findChatBtn(card), 4000);
     if (!btn) {
-      log(`未找到沟通按钮:${title}`);
+      log(`未找到沟通按钮:${title}｜详情面板${opened ? '已打开' : '未打开'}`);
       return 'fail';
     }
     const text = btn.textContent.trim();
@@ -576,6 +615,7 @@
       return 'skip';
     }
 
+    log(`点击沟通按钮:"${btn.textContent.trim()}"(${btn.className || btn.tagName})`);
     btn.click();
     // 等「留在此页」弹窗出现（最多 4 秒），出现后立即处理
     await waitFor(anyDialog, 4000, 120);
