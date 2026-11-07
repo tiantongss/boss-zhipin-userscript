@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      2.3.0
+// @version      2.5.0
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）；按关键词队列依次搜索，列表滚动到底自动切换下一个关键词，异常时由 AI 从有限动作集中选择处置动作
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -17,6 +17,7 @@
 // @connect      api.moonshot.cn
 // @connect      open.bigmodel.cn
 // @connect      api.siliconflow.cn
+// @connect      127.0.0.1
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -60,7 +61,11 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v2.3.0 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v2.5.0 (安全增强版)', 'BOSS海投助手');
+  // 探测本地点击服务是否在线（系统级真实点击依赖它）
+  _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
+    console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
+  );
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -238,6 +243,7 @@
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
     aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
+    realClick: true,   // 合成点击无效时，升级系统级真实鼠标点击(需本地服务 127.0.0.1:8901)
   };
   const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
 
@@ -314,6 +320,29 @@
     return true;
   }
 
+  /* ===== 系统级真实点击：坐标发给本地服务，由 Windows 移动真实鼠标 ===== */
+  // 把元素中心点的视口坐标换算成物理屏幕坐标（含浏览器窗口偏移与 DPI）
+  function elScreenPos(el) {
+    const r = el.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const sx = window.screenX + (window.outerWidth - window.innerWidth) / 2 + r.left + r.width / 2;
+    const sy = window.screenY + (window.outerHeight - window.innerHeight) + r.top + r.height / 2;
+    return { x: Math.round(sx * dpr), y: Math.round(sy * dpr) };
+  }
+
+  // 真实鼠标点击兜底：合成事件被页面忽略时使用。true=已派发
+  async function sysClick(el, label) {
+    if (!cfg.realClick || !el) return false;
+    if (!document.hasFocus()) { log(`跳过系统点击[${label}]:浏览器窗口不在前台(需保持BOSS窗口可见)`); return false; }
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+    await sleep(350);
+    const p = elScreenPos(el);
+    const res = await _gmPost('http://127.0.0.1:8901/click', p, {});
+    if (res && res.ok) { log(`系统级点击[${label}] (${p.x},${p.y})`); return true; }
+    log(`系统级点击失败[${label}]:本地服务未响应`);
+    return false;
+  }
+
   function detectRisk() {
     if (RISK.url.test(location.pathname + location.search)) return '网址疑似验证/登录/错误页:' + location.pathname;
     if (RISK.title.test(document.title)) return '页面标题异常:' + document.title;
@@ -381,6 +410,9 @@
       <label style="display:flex;align-items:center;gap:6px;margin-top:8px;color:#333">
         <input id="bag-aiEnabled" type="checkbox" style="width:auto">启用AI匹配
       </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:4px;color:#333">
+        <input id="bag-realClick" type="checkbox" style="width:auto">系统级真实点击(合成点击无效时升级,需本地服务)
+      </label>
       <label>接口地址</label><input id="bag-aiBase">
       <div class="row">
         <div><label>模型名</label><input id="bag-aiModel"></div>
@@ -415,6 +447,7 @@
   $('bag-maxd').value = cfg.maxDelay;
   $('bag-minScore').value = cfg.minScore;
   $('bag-aiEnabled').checked = !!cfg.aiEnabled;
+  $('bag-realClick').checked = !!cfg.realClick;
   $('bag-aiBase').value = cfg.aiBase;
   $('bag-aiModel').value = cfg.aiModel;
   $('bag-aiThreshold').value = cfg.aiThreshold;
@@ -453,6 +486,7 @@
     cfg.maxDelay = Math.max(cfg.minDelay, +$('bag-maxd').value || DEFAULTS.maxDelay);
     cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
     cfg.aiEnabled = !!$('bag-aiEnabled').checked;
+    cfg.realClick = !!$('bag-realClick').checked;
     cfg.aiBase = $('bag-aiBase').value.trim() || DEFAULTS.aiBase;
     cfg.aiModel = $('bag-aiModel').value.trim() || DEFAULTS.aiModel;
     cfg.aiThreshold = Math.min(100, Math.max(1, +$('bag-aiThreshold').value || DEFAULTS.aiThreshold));
@@ -742,6 +776,11 @@
         log('已点击"留在此页"');
         await sleep(rand(400, 700));
         if (await waitDialogGone(1500)) return true;
+        // 合成点击关不掉弹窗 → 升级系统级真实点击
+        if (await sysClick(btn, '留在此页')) {
+          await sleep(rand(400, 700));
+          if (await waitDialogGone(1500)) return true;
+        }
         continue;
       }
       const close = document.querySelector(`${SEL.dialog} .close, ${SEL.dialog} .icon-close, ${SEL.dialog} .cancel-btn`);
@@ -912,7 +951,15 @@
     log(`点击沟通按钮:"${text}"(${btn.className || btn.tagName})`);
     humanClick(btn);
     // 等「留在此页」弹窗出现（最多 4 秒），出现后立即处理
-    await waitFor(anyDialog, 4000, 120);
+    let dialogShown = await waitFor(anyDialog, 4000, 120);
+    if (!dialogShown) {
+      // 合成点击没弹出窗口 → 升级系统级真实鼠标点击重试一次
+      log('合成点击未弹窗,尝试系统级真实点击…');
+      if (await sysClick(btn, '立即沟通')) {
+        dialogShown = await waitFor(anyDialog, 4000, 120);
+      }
+      if (!dialogShown) log('真实点击后仍无弹窗,按失败处理');
+    }
 
     // 投递后再次严格检测是否触发风控限制
     const riskAfter = detectRisk();
