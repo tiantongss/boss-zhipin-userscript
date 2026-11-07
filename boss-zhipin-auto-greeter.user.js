@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.0
+// @version      1.2.1
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止
-// @updateURL    https://raw.githubusercontent.com/tiantongss/boss-zhipin-userscript/main/boss-zhipin-auto-greeter.user.js
-// @downloadURL  https://raw.githubusercontent.com/tiantongss/boss-zhipin-userscript/main/boss-zhipin-auto-greeter.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @grant        GM_getValue
