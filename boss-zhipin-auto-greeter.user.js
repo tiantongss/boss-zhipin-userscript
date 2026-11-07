@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.4.0
+// @version      3.4.1
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -36,13 +36,13 @@
     if (typeof GM_addStyle === 'function') { try { return GM_addStyle(css); } catch (e) {} }
     const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s;
   };
-  const _gmPost = (url, data, headers) => new Promise((resolve) => {
+  const _gmPost = (url, data, headers, timeoutMs) => new Promise((resolve) => {
     const body = JSON.stringify(data);
     const done = (txt, err) => { if (err) resolve(null); else { try { resolve(JSON.parse(txt)); } catch (e) { resolve(null); } } };
     if (typeof GM_xmlhttpRequest === 'function') {
       GM_xmlhttpRequest({
         method: 'POST', url, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}), data: body,
-        timeout: 20000,
+        timeout: timeoutMs || 20000,
         onload: (r) => done(r.responseText, r.status < 200 || r.status >= 300),
         onerror: () => resolve(null),
         ontimeout: () => resolve(null),
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.4.0 (采集模式+导出路径)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.4.1 (采集模式+图形化导出路径)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -728,7 +728,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.4.0(采集模式)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.4.1(采集模式)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -769,7 +769,11 @@
       <div class="row">
         <button id="bag-collect" style="background:#2e8b57">开始采集(不投递)</button>
       </div>
-      <label>导出路径(经本地服务写入;相对路径存到脚本目录,可填绝对路径)</label><input id="bag-exportpath" placeholder="如 boss-jobs.csv 或 D:\data\jobs.csv">
+      <label>导出路径(经本地服务写入;可手输或点浏览图形化选择目录)</label>
+      <div class="row">
+        <input id="bag-exportpath" placeholder="如 boss-jobs.csv 或 D:\data\jobs.csv" style="flex:1">
+        <button id="bag-browse" style="flex:0 0 auto">浏览…</button>
+      </div>
       <div class="row">
         <button id="bag-unlock" style="background:#888; margin-top:4px;">解除冷却(已手动处理)</button>
       </div>
@@ -2015,6 +2019,19 @@
     log(`已导出诊断日志 JSON(${n} 条)`);
   };
   $('bag-collect').onclick = () => !Task.working && runCollect();
+  // 浏览…:经本地服务调起 Windows 图形化目录选择框,选中的目录拼上当前文件名
+  $('bag-browse').onclick = async () => {
+    log('正在打开目录选择框(可能被浏览器挡住,留意任务栏)');
+    const r = await _gmPost('http://127.0.0.1:8901/pickdir', {}, {}, 120000);
+    if (r && r.ok && r.path) {
+      const fname = ($('bag-exportpath').value.split(/[\\/]/).pop() || '').trim() || 'boss-jobs.csv';
+      $('bag-exportpath').value = r.path.replace(/[\\/]+$/, '') + '\\' + fname;
+      readCfg(); // 保存到配置
+      log('导出路径已设为:' + $('bag-exportpath').value);
+    } else {
+      log(r ? '已取消选择' : '本地服务离线,无法打开选择框');
+    }
+  };
   $('bag-exportjobs').onclick = async () => {
     readCfg();
     await exportJobsSmart();
