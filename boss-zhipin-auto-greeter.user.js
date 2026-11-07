@@ -1462,7 +1462,7 @@
       if (reason) {
         alog('JOB_SKIPPED', `跳过:${title} @ ${company}(${reason})`,
           { action_type: 'SKIP', target: title + ' @ ' + company, reason });
-        await storeJob(card, { status: 'skipped', reason }));
+        await storeJob(card, { status: 'skipped', reason });
         return 'skip';
       }
     }
@@ -1503,7 +1503,7 @@
     if (hit) {
       alog('JOB_SKIPPED', '跳过(硬性排除:' + hit + '):' + title + ' @ ' + company,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: '硬性排除:' + hit });
-      await storeJob(card, { status: 'skipped', reason: '硬性排除:' + hit }));
+      await storeJob(card, { status: 'skipped', reason: '硬性排除:' + hit });
       return 'skip';
     }
 
@@ -1519,7 +1519,7 @@
     if (!/立即沟通|马上沟通|打招呼/.test(text)) {
       alog('JOB_SKIPPED', `已沟通过,跳过:${title} @ ${company}`,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: '已沟通过' });
-      await storeJob(card, { status: 'skipped', reason: '已沟通过' }));
+      await storeJob(card, { status: 'skipped', reason: '已沟通过' });
       return 'skip';
     }
 
@@ -1529,7 +1529,7 @@
     if (cfg.aiEnabled) {
       let ai = null;
       if (cfg.stealth) {
-        await storeJob(card, { status: 'analyzing' }));
+        await storeJob(card, { status: 'analyzing' });
         ai = await aiDeepEval(title, company, jd, readCompanyInfo());
         if (ai) aiEvalText = ai.summary || '';
       } else {
@@ -1540,7 +1540,7 @@
         if (ai.fit === false) {
           alog('JOB_SKIPPED', `跳过(AI判定不匹配${why ? ':' + why : ''}):${title} @ ${company}`,
             { action_type: 'SKIP', target: title + ' @ ' + company, reason: 'AI不匹配:' + why, score });
-          await storeJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score, aiEval: aiEvalText }));
+          await storeJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score, aiEval: aiEvalText });
           return 'skip';
         }
       }
@@ -1551,7 +1551,7 @@
     if (score < threshold) {
       alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
-      await storeJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score, aiEval: aiEvalText }));
+      await storeJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score, aiEval: aiEvalText });
       return 'skip';
     }
     alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
@@ -1574,7 +1574,7 @@
       verifyDesc: '弹窗出现',
     });
     if (!clickRes.ok) {
-      await storeJob(card, { status: 'click_failed', score }));
+      await storeJob(card, { status: 'click_failed', score });
       return 'fail';
     }
 
@@ -1591,7 +1591,7 @@
     sent++;
     alog('JOB_SENT', `✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`,
       { action_type: 'SEND', target: title + ' @ ' + company, result: 'success', score });
-    await storeJob(card, { status: 'sent', score, reason: why, aiEval: aiEvalText }));
+    await storeJob(card, { status: 'sent', score, reason: why, aiEval: aiEvalText });
     return 'ok';
   }
 
