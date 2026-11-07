@@ -149,3 +149,151 @@
       out.note = '薪资显示为混淆字体,未读取';
       return out;
     }
+    out.text = s;
+    const m = s.match(/(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)\s*(K|k|万|元\/天|元\/时|元\/月)?/);
+    if (m) {
+      out.min = m[1];
+      out.max = m[2];
+      out.unit = m[3] || '';
+    } else if (/面议/.test(s)) out.note = '面议';
+    const mm = s.match(/[·.](\d+)薪/);
+    if (mm) out.months = mm[1];
+    return out;
+  }
+
+  // 从福利/JD文本派生基础福利字段
+  function derive(t) {
+    const T = (t || '').replace(/(无|不|没有|不存在)\s*大小周/g, '');
+    const has = (re) => re.test(T);
+    const flag = (re) => (has(re) ? '是' : '未提及');
+    return {
+      双休: has(/单休|大小周|做六休|六天工作/) ? '单休或大小周' : has(/双休|五休二/) ? '是' : '未提及',
+      五险一金: flag(/五险一金|六险一金|五险二金|五险|社保|公积金/),
+      包吃: flag(/包吃|供餐|免费午餐|提供午餐|工作餐|食堂|包餐/),
+      包住: flag(/包住|宿舍|住宿|提供住房|人才公寓/),
+      餐补: flag(/餐补|餐饮补贴|伙食补|饭补|午餐补|用餐补/),
+      交通补贴: flag(/交通补|车补|通勤补|交通费|班车/),
+      年终奖多薪: flag(/年终奖|13薪|14薪|15薪|十三薪|年底双薪/),
+      年假体检节日: flag(/带薪年假|年假|体检|节日福利|生日福利|团建/),
+      补充保险股权: flag(/商业保险|补充医疗|补充保险|期权|股票|股权/),
+      加班说明: has(/不加班|无加班|无需加班|很少加班|基本不加班/)
+        ? '不加班/很少'
+        : has(/加班/)
+        ? has(/加班补助|加班费|加班补贴|调休/) ? '提及加班(有补贴/调休)' : '提及加班'
+        : '未提及',
+      轮班夜班: flag(/倒班|轮班|夜班|值班|7\*24|7x24|7×24|24小时|三班/),
+      出差: has(/不需要出差|无需出差|不出差|不用出差/) ? '不出差' : has(/出差|外派/) ? '需出差' : '未提及',
+      驻场现场: flag(/驻场|甲方|现场/),
+      全日制统招: flag(/全日制|统招/),
+      英语要求: flag(/英文|英语|English|CET/),
+    };
+  }
+
+  // 高级深度挖掘（技术白名单、合同性质、试用期、工作时间、证书等）
+  const TECH_WHITELIST = [
+    'Linux', 'Windows Server', 'VMware', 'ESXi', 'Docker', 'Kubernetes', 'K8s', 'Nginx', 'Zabbix', 'Prometheus',
+    'MySQL', 'Oracle', 'SQL Server', 'Redis', 'TCP/IP', 'VPN', 'VLAN', '交换机', '路由器', '防火墙',
+    'HCIP', 'HCIE', 'CCNP', 'CCIE', 'CISP', '软考', 'PMP', 'ITIL', 'CISAW', 'RHCE'
+  ];
+
+  function deriveAdvanced(desc, benefitsText) {
+    const fullText = desc + '\n' + benefitsText;
+    
+    // 1. 合同性质
+    let contract = '未提及';
+    if (/劳务派遣|第三方派遣|外包|驻场外包/.test(fullText)) contract = '外包/派遣';
+    else if (/正式编制|全职|签订劳动合同|五险一金/.test(fullText)) contract = '正式编/全职';
+
+    // 2. 试用期
+    const probationM = fullText.match(/试用期\s*([1-6]个月|[1-6]个半月)/);
+    const probation = probationM ? probationM[1] : (/无试用期/.test(fullText) ? '无试用期' : '未提及');
+
+    // 3. 工作时间
+    const timeM = fullText.match(/(\d{1,2}[:点]\d{0,2}\s*[-~到至]\s*\d{1,2}[:点]\d{0,2}|早\s*\d+[点:]\s*晚\s*\d+|大小周|单休|双休)/g);
+    const workTime = timeM ? [...new Set(timeM)].join(' / ') : '未提及';
+
+    // 4. 证书要求
+    const certs = TECH_WHITELIST.filter(w => /HCIP|HCIE|CCNP|CCIE|CISP|软考|PMP|ITIL|CISAW|RHCE/.test(w) && fullText.includes(w));
+
+    // 5. 核心技能_JD
+    const coreSkillsJD = TECH_WHITELIST.filter(w => fullText.includes(w));
+
+    // 6. 专业要求
+    const majorM = fullText.match(/(?:计算机|软件工程|网络工程|通信工程|信息安全|电子信息|自动化|理工科|不限专业)[^，。\n]{0,6}/g);
+    const major = majorM ? [...new Set(majorM)].join('、') : '未提及';
+
+    return {
+      合同性质: contract,
+      试用期: probation,
+      工作时间: workTime,
+      证书要求: certs.join('、') || '未提及',
+      核心技能_JD: coreSkillsJD.join('、'),
+      专业要求: major,
+    };
+  }
+
+  /* ===================== UI 界面构建 ===================== */
+  GM_addStyle(`
+    #bjc-panel{position:fixed;left:16px;bottom:16px;width:310px;z-index:99999;background:#fff;
+      border:1px solid #4a7cff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.18);
+      font:12px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#333}
+    #bjc-panel header{background:#4a7cff;color:#fff;padding:6px 10px;border-radius:9px 9px 0 0;
+      display:flex;justify-content:space-between;cursor:pointer;font-weight:600}
+    #bjc-body{padding:8px 10px;max-height:72vh;overflow:auto}
+    #bjc-panel label{display:block;margin:4px 0 2px;color:#666}
+    #bjc-panel textarea,#bjc-panel select{width:100%;box-sizing:border-box;padding:3px 6px;border:1px solid #ccc;border-radius:4px;font:inherit}
+    #bjc-panel input[type=text],#bjc-panel input[type=number],#bjc-panel input:not([type]){width:100%;box-sizing:border-box;padding:3px 6px;border:1px solid #ccc;border-radius:4px}
+    #bjc-panel .row{display:flex;gap:6px}
+    #bjc-panel .chk{display:flex;align-items:center;gap:4px;margin-top:6px}
+    #bjc-panel button{flex:1;margin-top:8px;padding:5px;border:0;border-radius:4px;color:#fff;cursor:pointer;background:#4a7cff}
+    #bjc-panel button.red{background:#e55}#bjc-panel button.gray{background:#888}
+    #bjc-panel button:disabled{opacity:.5;cursor:not-allowed}
+    #bjc-count{margin-top:6px;font-weight:600;color:#4a7cff}
+    #bjc-log{margin-top:6px;height:130px;overflow:auto;background:#f6f6f6;border-radius:4px;padding:4px 6px;
+      font-size:11px;white-space:pre-wrap}
+  `);
+
+  const panel = document.createElement('div');
+  panel.id = 'bjc-panel';
+  panel.innerHTML = `
+    <header><span>岗位采集助手 v1.4.1</span><span id="bjc-toggle">收起</span></header>
+    <div id="bjc-body">
+      <label>目标岗位(逗号分隔)</label><textarea id="bjc-titles" rows="3"></textarea>
+      <label>职位名排除词</label><input id="bjc-exclude">
+      <label>匹配方式</label>
+      <select id="bjc-mode"><option value="loose">宽松(含核心词,如"系统运维")</option><option value="strict">严格(含完整岗位名)</option></select>
+      <label>岗位描述需命中其一(可选)</label><input id="bjc-desc" placeholder="例:Linux,VMware,交换机">
+      <div class="row">
+        <div><label>本次数量</label><input id="bjc-max" type="number" min="1"></div>
+        <div><label>间隔下限(s)</label><input id="bjc-min" type="number" min="1"></div>
+        <div><label>间隔上限(s)</label><input id="bjc-maxd" type="number" min="1"></div>
+      </div>
+      <label class="chk"><input id="bjc-refresh" type="checkbox"> 补采缺少新字段的旧记录</label>
+      <div class="row">
+        <div><label>连续失败熔断(条)</label><input id="bjc-maxfail" type="number" min="1"></div>
+        <div><label>每日上限(条)</label><input id="bjc-daily" type="number" min="1"></div>
+        <div><label>冷却(分钟)</label><input id="bjc-cool" type="number" min="1"></div>
+      </div>
+      <div class="row"><button id="bjc-start">开始采集</button><button id="bjc-stop" class="red">停止</button></div>
+      <div class="row"><button id="bjc-csv" class="gray">导出CSV</button><button id="bjc-json" class="gray">导出JSON</button><button id="bjc-clear" class="gray">清空</button></div>
+      <div class="row"><button id="bjc-import" class="gray">导入JSON(合并)</button></div>
+      <div class="row"><button id="bjc-diag" class="gray">诊断选择器</button><button id="bjc-struct" class="gray">复制页面结构</button></div>
+      <div class="row"><button id="bjc-unlock" class="gray">解除冷却(须已手动处理验证)</button></div>
+      <input id="bjc-file" type="file" accept=".json,application/json" style="display:none">
+      <div id="bjc-count"></div>
+      <div id="bjc-log"></div>
+    </div>`;
+  document.body.appendChild(panel);
+
+  const $ = (id) => document.getElementById(id);
+  $('bjc-titles').value = cfg.titles;
+  $('bjc-exclude').value = cfg.exclude;
+  $('bjc-mode').value = cfg.mode;
+  $('bjc-desc').value = cfg.descInclude;
+  $('bjc-max').value = cfg.max;
+  $('bjc-min').value = cfg.minDelay;
+  $('bjc-maxd').value = cfg.maxDelay;
+  $('bjc-refresh').checked = !!cfg.refresh;
+  $('bjc-maxfail').value = cfg.maxFail;
+  $('bjc-daily').value = cfg.dailyMax;
+  $('bjc-cool').value = cfg.cooldownMin;
