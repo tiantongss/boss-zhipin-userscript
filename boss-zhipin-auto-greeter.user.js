@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.0.0
+// @version      3.0.1
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.0.0 (模块化·可观测版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.0.1 (模块化·可观测版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -236,7 +236,7 @@
     chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat, [ka*="job-detail-chat"], .job-detail-op .btn, .job-detail-container .btn-startchat, .job-detail-op .btn-startchat',
     nextPage: '.options-pages a.next, .options-pages .next',
     dialog: '.dialog-container, .greet-boss-dialog',
-    jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text',
+    jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text, [class*="job-sec"] [class*="text"], .job-detail-content, .detail-content, [class*="job-description"]',
   };
 
   /* ===== AI 语义匹配（OpenAI 兼容 /chat/completions） ===== */
@@ -435,9 +435,23 @@
     try { ov = [...document.querySelectorAll(RISK.overlay)].find(visible); } catch (e) {}
     if (ov) return '检测到验证类弹窗或滑块控件';
 
-    // 检查页面主体或弹窗中是否包含风控/频繁短语
-    const bodyText = [...document.body.children].filter((c) => c !== panel).map(el => el.textContent || '').join('\n');
-    const hit = RISK.phrases.find((p) => bodyText.includes(p));
+    // 短语扫描:排除岗位卡片与详情区——运维类 JD 常含"访问异常/故障/频繁"等词,扫全文会误报熔断
+    // 只扫描通知/toast/标题等非岗位区域的可见文本
+    const skipSel = SEL.card + ',' + SEL.detailBox;
+    let pageText = '';
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => {
+          const p = n.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          if (p.closest('#bag-panel') || p.closest(skipSel)) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let node;
+      while ((node = walker.nextNode())) pageText += (node.nodeValue || '') + '\n';
+    } catch (e) {}
+    const hit = RISK.phrases.find((p) => pageText.includes(p));
     if (hit) return '页面出现风控/限制提示:' + hit;
 
     return '';
@@ -570,7 +584,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.0(可观测版)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.0.1(可观测版)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限)</label><input id="bag-include">
@@ -885,11 +899,21 @@
     return `${t}|${jd.length}|${jd.slice(0, 30)}`;
   }
 
+  // 读取 JD 文本:优先精确选择器;选择器失效时回退到可见详情容器整体文本
+  function readJd() {
+    const el = [...document.querySelectorAll(SEL.jdText)]
+      .find((e) => visible(e) && (e.textContent || '').trim().length > 30);
+    if (el) return (el.textContent || '').trim();
+    const box = [...document.querySelectorAll(SEL.detailBox)].filter(visible)
+      .sort((a, b) => (b.innerText || '').length - (a.innerText || '').length)[0];
+    const t = box ? (box.innerText || '').trim() : '';
+    return t.length > 80 ? t : '';
+  }
+
   // 打开岗位详情：点标题后等「指纹变化」，避免读到上一个岗位残留的 JD
   async function openDetail(card) {
     const before = detailFingerprint();
-    const hasJd = () => [...document.querySelectorAll(SEL.jdText)]
-      .some((el) => visible(el) && (el.textContent || '').trim().length > 30);
+    const hasJd = () => readJd().length > 30;
     const switched = () => hasJd() && detailFingerprint() !== before;
 
     card.scrollIntoView({ block: 'center' });
@@ -908,7 +932,7 @@
     // 指纹没变但页面本来就有 JD（首个岗位默认已展开），也算可用
     const ok = hasJd();
     alog(ok ? 'DETAIL_DETECTED' : 'DETAIL_TIMEOUT',
-      ok ? '详情区已有JD(首岗默认展开)' : '详情区未检测到JD',
+      ok ? '详情区已有JD(首岗默认展开)' : '详情区已切换但未读到JD(选择器失效或JD未加载)',
       { action_type: 'CLICK', target: '岗位卡片', result: ok ? 'success' : 'timeout', state_changed: detailFingerprint() !== before });
     return ok;
   }
@@ -1144,8 +1168,6 @@
   // 提取一条岗位记录（P4）
   function extractJob(card, meta) {
     const q = (sel) => (card.querySelector(sel)?.textContent || '').trim();
-    const jdEl = [...document.querySelectorAll(SEL.jdText)]
-      .find((el) => visible(el) && (el.textContent || '').trim().length > 10);
     const a = card.querySelector('a[href*="/job_detail/"]');
     return {
       key: cardKey(card),
@@ -1153,7 +1175,7 @@
       company: q(SEL.cardCompany),
       salary: q('.salary'),
       area: q('.job-area'),
-      jd: jdEl ? (jdEl.textContent || '').trim().slice(0, 800) : '',
+      jd: readJd().slice(0, 800),
       url: a ? a.href : '',
       score: meta && meta.score != null ? meta.score : null,
       reason: (meta && meta.reason) || '',
@@ -1169,7 +1191,8 @@
 
     const reason = passFilter(title, company);
     if (reason) {
-      log(`跳过:${title} @ ${company}(${reason})`);
+      alog('JOB_SKIPPED', `跳过:${title} @ ${company}(${reason})`,
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason });
       await JobStore.put(extractJob(card, { status: 'skipped', reason }));
       return 'skip';
     }
@@ -1198,31 +1221,31 @@
       await sleep(rand(700, 1100));
       opened = await openDetail(card);
     }
-    const jdEl = opened
-      ? [...document.querySelectorAll(SEL.jdText)].find((el) => visible(el) && (el.textContent || '').trim().length > 30) || null
-      : null;
-    if (!jdEl) log(`未读到JD，改按标题与卡片标签打分:${title}`);
+    const jd = opened ? readJd() : '';
+    if (!jd) log(`未读到JD，改按标题与卡片标签打分:${title}`);
 
-    const jobText = `${title} ${card.textContent || ''} ${jdEl ? jdEl.textContent : ''}`;
+    const jobText = `${title} ${card.textContent || ''} ${jd}`;
 
     // 硬性排除：命中即跳过（先于任何打分）
-    const hit = HARD_BLOCK.find((k) => (title + company + (jdEl ? jdEl.textContent : '')).includes(k));
+    const hit = HARD_BLOCK.find((k) => (title + company + jd).includes(k));
     if (hit) {
-      log('跳过(硬性排除:' + hit + '):' + title + ' @ ' + company);
+      alog('JOB_SKIPPED', '跳过(硬性排除:' + hit + '):' + title + ' @ ' + company,
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason: '硬性排除:' + hit });
       await JobStore.put(extractJob(card, { status: 'skipped', reason: '硬性排除:' + hit }));
       return 'skip';
     }
 
     let score = null, hits = [], why = '';
     if (cfg.aiEnabled) {
-      const ai = await aiScore(title, company, jdEl ? jdEl.textContent : '');
+      const ai = await aiScore(title, company, jd);
       if (ai) { score = ai.score; why = ai.reason; }
       else log('AI 调用失败，回退本地匹配');
     }
     if (score == null) { const r = scoreJob(jobText, title); score = r.score; hits = r.hits; }
     const threshold = cfg.aiEnabled ? Number(cfg.aiThreshold || 60) : Number(cfg.minScore || 45);
     if (score < threshold) {
-      log(`跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`);
+      alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
       await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score }));
       return 'skip';
     }
@@ -1239,7 +1262,8 @@
     }
     const text = btn.textContent.trim();
     if (!/立即沟通|马上沟通|打招呼/.test(text)) {
-      log(`已沟通过,跳过:${title} @ ${company}`);
+      alog('JOB_SKIPPED', `已沟通过,跳过:${title} @ ${company}`,
+        { action_type: 'SKIP', target: title + ' @ ' + company, reason: '已沟通过', score });
       await JobStore.put(extractJob(card, { status: 'skipped', reason: '已沟通过', score }));
       return 'skip';
     }
