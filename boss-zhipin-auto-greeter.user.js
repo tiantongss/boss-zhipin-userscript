@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.4.2
+// @version      3.5.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.4.2 (采集模式+图形化导出路径)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.5.0 (增量采集表格+投递同步采集)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -252,6 +252,7 @@
     stealthMin: 30,       // 挂机模式每岗间隔下限(秒)
     stealthMax: 75,       // 挂机模式每岗间隔上限(秒)
     exportPath: 'boss-jobs.csv', // 采集数据导出路径(经本地服务写入;相对路径存到脚本目录,可填绝对路径)
+    collectSync: false,   // 投递时同步采集(全字段写库+逐条追加导出表格;采集与投递同频,共享同一随机节奏)
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
     aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
@@ -728,7 +729,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.4.2(采集模式)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.5.0(增量采集表)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -769,6 +770,9 @@
       <div class="row">
         <button id="bag-collect" style="background:#2e8b57">开始采集(不投递)</button>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;color:#333">
+        <input id="bag-collectsync" type="checkbox" style="width:auto">投递时同步采集(与投递同频,逐条写入导出表格)
+      </label>
       <label>导出路径(经本地服务写入;可手输或点浏览图形化选择目录)</label>
       <div class="row">
         <input id="bag-exportpath" placeholder="如 boss-jobs.csv 或 D:\data\jobs.csv" style="flex:1">
@@ -802,6 +806,7 @@
   $('bag-stmin').value = cfg.stealthMin;
   $('bag-stmax').value = cfg.stealthMax;
   $('bag-exportpath').value = cfg.exportPath;
+  $('bag-collectsync').checked = !!cfg.collectSync;
   $('bag-minScore').value = cfg.minScore;
   $('bag-aiEnabled').checked = !!cfg.aiEnabled;
   $('bag-realClick').checked = !!cfg.realClick;
@@ -851,6 +856,7 @@
     cfg.stealthMin = Math.max(10, +$('bag-stmin').value || DEFAULTS.stealthMin);
     cfg.stealthMax = Math.max(cfg.stealthMin, +$('bag-stmax').value || DEFAULTS.stealthMax);
     cfg.exportPath = $('bag-exportpath').value.trim() || DEFAULTS.exportPath;
+    cfg.collectSync = $('bag-collectsync').checked;
     cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
     cfg.aiEnabled = !!$('bag-aiEnabled').checked;
     cfg.realClick = !!$('bag-realClick').checked;
@@ -1370,13 +1376,11 @@
         } catch (e) { res([]); }
       });
     }
+    const HEAD = ['岗位', '公司', '薪资', '地区', '经验/学历', '公司信息', 'HR', '匹配度', '状态', '评估理由', 'AI综合评估', 'JD摘要', '时间', '链接'];
+    const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const lineOf = (j) => [j.title, j.company, j.salary, j.area, j.tags, j.companyInfo, j.hr, j.score, j.status, j.reason, j.aiEval, (j.jd || '').slice(0, 120), j.ts, j.url].map(esc).join(',');
     function toCsv(rows) {
-      const head = ['岗位', '公司', '薪资', '地区', '经验/学历', '公司信息', 'HR', '匹配度', '状态', '评估理由', 'AI综合评估', 'JD摘要', '时间', '链接'];
-      const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-      const lines = [head.join(',')].concat(
-        rows.map((j) => [j.title, j.company, j.salary, j.area, j.tags, j.companyInfo, j.hr, j.score, j.status, j.reason, j.aiEval, (j.jd || '').slice(0, 120), j.ts, j.url].map(esc).join(','))
-      );
-      return '﻿' + lines.join('\n');
+      return '﻿' + [HEAD.join(',')].concat(rows.map(lineOf)).join('\n');
     }
     async function exportCsv() {
       const rows = await all();
@@ -1388,7 +1392,7 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
       return rows.length;
     }
-    return { put, all, toCsv, exportCsv };
+    return { put, all, toCsv, exportCsv, csvHeader: () => '﻿' + HEAD.join(',') + '\r\n', csvLine: lineOf };
   })();
 
   // 卡片去重键（DOM 节点会重渲染，用字符串键）
@@ -1431,6 +1435,22 @@
     return base;
   }
 
+  /* ===== 投递时同步采集 =====
+   * 关闭(默认):投递模式不做任何采集写库,纯投递。
+   * 开启:每个处理过的岗位全字段写库并逐条追加到导出表格。
+   * 采集与投递天然同频——在同一次卡片处理流程内完成,共享同一套随机间隔与拟人节奏,
+   * 不存在速率不对称问题。 */
+  let syncCtx = null;
+  async function storeJob(card, meta) {
+    if (!cfg.collectSync) return;
+    const rec = extractFull(card, meta);
+    await JobStore.put(rec);
+    if (syncCtx && syncCtx.fileOk) {
+      const ok = await serverSave(cfg.exportPath, JobStore.csvLine(rec) + '\r\n', true);
+      if (!ok) { syncCtx.fileOk = false; log('表格写入失败,转内存暂存,结束后统一导出'); }
+    }
+  }
+
   async function processCard(card) {
     await checkpoint();
     const title = (card.querySelector(SEL.cardTitle)?.textContent || '').trim();
@@ -1442,7 +1462,7 @@
       if (reason) {
         alog('JOB_SKIPPED', `跳过:${title} @ ${company}(${reason})`,
           { action_type: 'SKIP', target: title + ' @ ' + company, reason });
-        await JobStore.put(extractJob(card, { status: 'skipped', reason }));
+        await storeJob(card, { status: 'skipped', reason }));
         return 'skip';
       }
     }
@@ -1483,7 +1503,7 @@
     if (hit) {
       alog('JOB_SKIPPED', '跳过(硬性排除:' + hit + '):' + title + ' @ ' + company,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: '硬性排除:' + hit });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: '硬性排除:' + hit }));
+      await storeJob(card, { status: 'skipped', reason: '硬性排除:' + hit }));
       return 'skip';
     }
 
@@ -1499,7 +1519,7 @@
     if (!/立即沟通|马上沟通|打招呼/.test(text)) {
       alog('JOB_SKIPPED', `已沟通过,跳过:${title} @ ${company}`,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: '已沟通过' });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: '已沟通过' }));
+      await storeJob(card, { status: 'skipped', reason: '已沟通过' }));
       return 'skip';
     }
 
@@ -1509,7 +1529,7 @@
     if (cfg.aiEnabled) {
       let ai = null;
       if (cfg.stealth) {
-        await JobStore.put(extractJob(card, { status: 'analyzing' }));
+        await storeJob(card, { status: 'analyzing' }));
         ai = await aiDeepEval(title, company, jd, readCompanyInfo());
         if (ai) aiEvalText = ai.summary || '';
       } else {
@@ -1520,7 +1540,7 @@
         if (ai.fit === false) {
           alog('JOB_SKIPPED', `跳过(AI判定不匹配${why ? ':' + why : ''}):${title} @ ${company}`,
             { action_type: 'SKIP', target: title + ' @ ' + company, reason: 'AI不匹配:' + why, score });
-          await JobStore.put(extractJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score, aiEval: aiEvalText }));
+          await storeJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score, aiEval: aiEvalText }));
           return 'skip';
         }
       }
@@ -1531,7 +1551,7 @@
     if (score < threshold) {
       alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score, aiEval: aiEvalText }));
+      await storeJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score, aiEval: aiEvalText }));
       return 'skip';
     }
     alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
@@ -1554,7 +1574,7 @@
       verifyDesc: '弹窗出现',
     });
     if (!clickRes.ok) {
-      await JobStore.put(extractJob(card, { status: 'click_failed', score }));
+      await storeJob(card, { status: 'click_failed', score }));
       return 'fail';
     }
 
@@ -1571,7 +1591,7 @@
     sent++;
     alog('JOB_SENT', `✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`,
       { action_type: 'SEND', target: title + ' @ ' + company, result: 'success', score });
-    await JobStore.put(extractJob(card, { status: 'sent', score, reason: why, aiEval: aiEvalText }));
+    await storeJob(card, { status: 'sent', score, reason: why, aiEval: aiEvalText }));
     return 'ok';
   }
 
@@ -1858,6 +1878,13 @@
     else log(`过滤配置:包含[${cfg.include || '空(不限)'}] 排除[${cfg.exclude || '空'}] 排除公司[${cfg.excludeCompany || '空'}] 最低分[${cfg.minScore}]`);
     if (cfg.stealth) log(`挂机模式:间隔${cfg.stealthMin}-${cfg.stealthMax}s/岗,每8-15岗休息2-5分钟,含拟人阅读滚动`);
     if (cfg.stealth && !cfg.aiEnabled) log('提示:挂机模式未启用AI,按本地规则打分,无深度分析(公司/行业评估)');
+    // 投递时同步采集:启动即创建表格,与投递同频逐条写入
+    syncCtx = null;
+    if (cfg.collectSync) {
+      const created = await serverSave(cfg.exportPath, JobStore.csvHeader(), false);
+      syncCtx = { fileOk: !!created };
+      log(created ? `采集同步:已创建表格 ${created},与投递同频逐条写入` : '采集同步:本地服务离线,数据内存暂存,结束后统一导出');
+    }
 
     try {
       for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
@@ -1896,13 +1923,17 @@
     _gmSet('bag_hb', 0);
     $('bag-start').disabled = false;
     updateStatus();
+    if (cfg.collectSync) {
+      if (syncCtx && syncCtx.fileOk) log(`采集同步结束,表格已保存:${cfg.exportPath}`);
+      else await exportJobsSmart();
+    }
     log(`结束，本次共投递 ${sent} 个`);
   }
 
   /* ===================== 采集模式:不投递,拟人节奏逐卡全字段采集 ===================== */
   // 经本地服务把内容写入指定路径;失败返回 null(服务离线或路径非法)
-  async function serverSave(filePath, content) {
-    const r = await _gmPost('http://127.0.0.1:8901/save', { path: filePath, content }, {});
+  async function serverSave(filePath, content, append) {
+    const r = await _gmPost('http://127.0.0.1:8901/save', { path: filePath, content, append: !!append }, {});
     return r && r.ok ? (r.saved || filePath) : null;
   }
 
@@ -1917,8 +1948,8 @@
     return n;
   }
 
-  // 单个关键词:从首卡走到列表底部,逐卡打开详情,全字段提取入库
-  async function collectKeyword(kw) {
+  // 单个关键词:从首卡走到列表底部,逐卡打开详情,全字段提取入库并追加表格
+  async function collectKeyword(kw, ctx) {
     let idx = 0, dryRounds = 0, got = 0;
     while (Task.working) {
       await checkpoint();
@@ -1952,6 +1983,11 @@
       if (!opened) rec.reason = '详情未打开,仅卡片字段';
       await JobStore.put(rec);
       got++;
+      // 逐条追加到采集表格;写失败转内存暂存
+      if (ctx.fileOk) {
+        const okApp = await serverSave(cfg.exportPath, JobStore.csvLine(rec) + '\r\n', true);
+        if (!okApp) { ctx.fileOk = false; log('表格写入失败,转内存暂存,结束后统一导出'); }
+      }
       alog('JOB_COLLECTED', `采集(${got}):${rec.title} @ ${rec.company}`,
         { action_type: 'COLLECT', target: rec.title + ' @ ' + rec.company, result: 'saved' });
       // 拟人随机间隔(复用挂机间隔配置)
@@ -1971,6 +2007,11 @@
     $('bag-collect').disabled = true;
     $('bag-start').disabled = true;
     log(`采集模式:${kws.length} 个关键词,拟人间隔${cfg.stealthMin}-${cfg.stealthMax}s/岗,完成后导出到[${cfg.exportPath}]`);
+    // 启动即创建采集表格(写入表头),之后每采一条追加一行;中途停止表格也是最新的
+    const ctx = { fileOk: false };
+    const created = await serverSave(cfg.exportPath, JobStore.csvHeader(), false);
+    if (created) { ctx.fileOk = true; log(`已创建采集表格:${created},逐条写入中`); }
+    else log('本地服务离线,采集数据先存内存,结束后统一导出');
 
     try {
       for (let i = 0; i < kws.length && Task.working; i++) {
@@ -1981,7 +2022,7 @@
         await sleep(rand(600, 1000));
         const okSearch = await doSearch(kw);
         if (!okSearch) { log(`「${kw}」搜索失败,跳过`); continue; }
-        await collectKeyword(kw);
+        await collectKeyword(kw, ctx);
       }
       if (Task.working) Task.set('COMPLETED', '采集完成');
     } catch (e) {
@@ -1993,8 +2034,8 @@
     _gmSet('bag_hb', 0);
     $('bag-collect').disabled = false;
     $('bag-start').disabled = false;
-    const n = await exportJobsSmart(); // 采集结束自动导出到配置路径
-    log(`采集结束,导出 ${n} 条`);
+    if (ctx.fileOk) log(`采集结束,表格已保存:${cfg.exportPath}`);
+    else { const n = await exportJobsSmart(); log(`采集结束,已统一导出 ${n} 条`); }
   }
 
   /* ===================== 按钮绑定 ===================== */
