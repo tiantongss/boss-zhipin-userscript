@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.6
-// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控
+// @version      1.3.0
+// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
@@ -10,6 +10,13 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      api.openai.com
+// @connect      api.deepseek.com
+// @connect      dashscope.aliyuncs.com
+// @connect      api.moonshot.cn
+// @connect      open.bigmodel.cn
+// @connect      api.siliconflow.cn
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -35,8 +42,25 @@
     try { document.execCommand('copy'); } catch (e) { console.warn('[兼容层] 复制失败', e); }
     ta.remove();
   };
+  const _gmPost = (url, data, headers) => new Promise((resolve) => {
+    const body = JSON.stringify(data);
+    const done = (txt, err) => { if (err) resolve(null); else { try { resolve(JSON.parse(txt)); } catch (e) { resolve(null); } } };
+    if (typeof GM_xmlhttpRequest === 'function') {
+      GM_xmlhttpRequest({
+        method: 'POST', url, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}), data: body,
+        timeout: 20000,
+        onload: (r) => done(r.responseText, r.status < 200 || r.status >= 300),
+        onerror: () => resolve(null),
+        ontimeout: () => resolve(null),
+      });
+    } else {
+      fetch(url, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}), body })
+        .then((r) => r.text().then((t) => done(t, !r.ok)))
+        .catch(() => resolve(null));
+    }
+  });
 
-  console.log('[%s] 脚本已加载 v1.2.6 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.3.0 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -53,6 +77,19 @@
     baseWeight: 60,
   };
 
+  /* ===== 简历全文（AI 语义匹配用） ===== */
+  const RESUME_TEXT = [
+    '25岁，专科（浙江机电职业技术大学 数控技术专业），意向城市杭州，约3年运维经验。',
+    '专业技能：Linux/Windows 系统管理与维护；Web 服务器搭建；Docker 与容器虚拟化；局域网维护与故障处理；TCP/IP、VLAN、ACL、DNS、DHCP、VPN；x86 服务器、防火墙、路由器、三层交换机配置；桌面与办公设备（打印机/扫描仪/投影仪）维护；SQL/MySQL；Python/Shell 脚本；AI 工具应用与改进方案。',
+    '工作经历1：AI Agent 工程师，负责 OpenClaw 智能体部署、环境搭建、日常运维与参数调优，设计 AI 自动化工作流，对接大模型接口，编写自动化脚本。',
+    '工作经历2：运维工程师（银行网点），负责桌面电脑与办公设备软硬件维护、机房设备日常维护、企业局域网维护与故障排查、域控与用户权限管理、资产管理与 IT 支持。',
+    '工作经历3：运维工程师（IDC 机房），x86 服务器维护保养升级与故障排除、WindowsServer/Linux 安装配置、7x24 机房运维监控、网络故障诊断、客户资产统计与工单处理。',
+    '项目：OpenVPN 异地组网（阿里云轻量服务器 + Ubuntu 部署，实现跨地域内网互联）。',
+  ].join('\n');
+
+  /* ===== 硬性排除（命中即跳过，先于任何打分） ===== */
+  const HARD_BLOCK = ['销售', '外包', '驻场', '中介', '派遣', '人力资源服务', '猎头'];
+
   function scoreJob(text, title) {
     const t = (text || '').toLowerCase();
     const ty = (title || '').toLowerCase();
@@ -67,6 +104,73 @@
     return { score, hits };
   }
 
+  /* ===== AI 语义匹配（OpenAI 兼容 /chat/completions） ===== */
+  const AI_CACHE_TTL = 7 * 24 * 3600 * 1000;
+  let _aiLastAt = 0;
+
+  async function aiScore(title, company, jd) {
+    const key = _gmGet('aiKey', '');
+    if (!key) return null;
+
+    const ck = title + '|' + company;
+    const cache = _gmGet('ai_cache', {}) || {};
+    const old = cache[ck];
+    if (old && typeof old.s === 'number' && old.t && Date.now() - old.t < AI_CACHE_TTL) {
+      return { score: old.s, reason: old.r || '' };
+    }
+
+    // 全局限速：两次调用间隔 ≥1000ms
+    const gap = _aiLastAt + 1000 - Date.now();
+    if (gap > 0) await sleep(gap);
+    _aiLastAt = Date.now();
+
+    const prompt = [
+      '判断下列岗位与候选人简历的匹配程度，按运维/IT支持/AI工程方向评估。',
+      '【简历】',
+      RESUME_TEXT,
+      '【岗位】' + title + ' @ ' + company,
+      '【岗位描述】',
+      (jd || '').slice(0, 1800),
+      '只输出 JSON：{"score":0-100,"reason":"30字内","fit":true|false}',
+    ].join('\n');
+
+    const res = await _gmPost(cfg.aiBase.replace(/\/+$/, '') + '/chat/completions', {
+      model: cfg.aiModel,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: '你是技术招聘匹配专家，只输出JSON' },
+        { role: 'user', content: prompt },
+      ],
+    }, { Authorization: 'Bearer ' + key });
+    if (!res) return null;
+
+    try {
+      let txt = (((res.choices || [])[0] || {}).message || {}).content || '';
+      txt = String(txt).replace(/```json/gi, '').replace(/```/g, '').trim();
+      const m = txt.match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      const o = JSON.parse(m[0]);
+      const score = Math.min(100, Math.max(0, Math.round(Number(o.score))));
+      if (!isFinite(score)) return null;
+      const reason = String(o.reason || '').replace(/\s+/g, ' ').slice(0, 30);
+
+      // 写缓存：清理过期项；超过 500 条清空重建
+      const now = Date.now();
+      const next = {};
+      for (const k of Object.keys(cache)) {
+        const v = cache[k];
+        if (v && v.t && now - v.t < AI_CACHE_TTL) next[k] = v;
+      }
+      next[ck] = { s: score, r: reason, t: now };
+      const cnt = Object.keys(next).length;
+      _gmSet('ai_cache', cnt > 500 ? { [ck]: next[ck] } : next);
+
+      return { score, reason };
+    } catch (e) {
+      return null;
+    }
+  }
+
   /* ===================== 配置 ===================== */
   const DEFAULTS = {
     include: '',          // 职位名必须包含其一(逗号分隔,留空不限)
@@ -78,6 +182,7 @@
     maxDelay: 20,         // 每次投递最大间隔(秒)
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
+    aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
   };
   const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
 
@@ -193,6 +298,15 @@
       <div class="row">
         <div><label>最低匹配度</label><input id="bag-minScore" type="number" min="1" max="100"></div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;color:#333">
+        <input id="bag-aiEnabled" type="checkbox" style="width:auto">启用AI匹配
+      </label>
+      <label>接口地址</label><input id="bag-aiBase">
+      <div class="row">
+        <div><label>模型名</label><input id="bag-aiModel"></div>
+        <div><label>AI 匹配阈值</label><input id="bag-aiThreshold" type="number" min="1" max="100"></div>
+      </div>
+      <label>API Key（仅存本地）</label><input id="bag-aiKey" type="password" autocomplete="off">
       <div class="row">
         <button id="bag-start">开始投递</button>
         <button id="bag-stop">停止</button>
@@ -213,6 +327,11 @@
   $('bag-min').value = cfg.minDelay;
   $('bag-maxd').value = cfg.maxDelay;
   $('bag-minScore').value = cfg.minScore;
+  $('bag-aiEnabled').checked = !!cfg.aiEnabled;
+  $('bag-aiBase').value = cfg.aiBase;
+  $('bag-aiModel').value = cfg.aiModel;
+  $('bag-aiThreshold').value = cfg.aiThreshold;
+  $('bag-aiKey').value = _gmGet('aiKey', '');
 
   panel.querySelector('header').onclick = () => {
     const b = $('bag-body');
@@ -245,6 +364,11 @@
     cfg.minDelay = Math.max(3, +$('bag-min').value || DEFAULTS.minDelay);
     cfg.maxDelay = Math.max(cfg.minDelay, +$('bag-maxd').value || DEFAULTS.maxDelay);
     cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
+    cfg.aiEnabled = !!$('bag-aiEnabled').checked;
+    cfg.aiBase = $('bag-aiBase').value.trim() || DEFAULTS.aiBase;
+    cfg.aiModel = $('bag-aiModel').value.trim() || DEFAULTS.aiModel;
+    cfg.aiThreshold = Math.min(100, Math.max(1, +$('bag-aiThreshold').value || DEFAULTS.aiThreshold));
+    _gmSet('aiKey', $('bag-aiKey').value.trim()); // Key 单独存储，不进 cfg
     _gmSet('cfg', cfg);
   }
 
@@ -337,15 +461,15 @@
   }
 
   /* ===== 发送简历附件 ===== */
-  const RESUME_TEXT = /^(发送简历|发简历|附件简历|发送附件简历|简历附件)$/;
+  const RESUME_BTN_TEXT = /^(发送简历|发简历|附件简历|发送附件简历|简历附件)$/;
 
   function findResumeBtn(scope) {
     const root = scope || document;
     const els = root.querySelectorAll('a,button,span,div,li,i');
     for (const el of els) {
       if (el.offsetParent === null) continue;
-      if (RESUME_TEXT.test((el.textContent || '').trim())) {
-        const inner = [...el.querySelectorAll('*')].find((c) => RESUME_TEXT.test((c.textContent || '').trim()));
+      if (RESUME_BTN_TEXT.test((el.textContent || '').trim())) {
+        const inner = [...el.querySelectorAll('*')].find((c) => RESUME_BTN_TEXT.test((c.textContent || '').trim()));
         return inner || el;
       }
     }
@@ -422,12 +546,24 @@
     }, 4000);
 
     const jobText = `${title} ${card.textContent || ''} ${jdEl ? jdEl.textContent : ''}`;
-    const { score, hits } = scoreJob(jobText, title);
-    if (score < Number(cfg.minScore || 45)) {
-      log(`跳过(匹配度${score}<${cfg.minScore}):${title} @ ${company}`);
+
+    // 硬性排除：命中即跳过（先于任何打分）
+    const hit = HARD_BLOCK.find((k) => (title + company + (jdEl ? jdEl.textContent : '')).includes(k));
+    if (hit) {
+      log('跳过(硬性排除:' + hit + '):' + title + ' @ ' + company);
       return 'skip';
     }
-    log(`匹配度${score}(命中:${hits.slice(0, 6).join('/') || '无'}):${title} @ ${company}`);
+
+    let score = null, hits = [], why = '';
+    if (cfg.aiEnabled) {
+      const ai = await aiScore(title, company, jdEl ? jdEl.textContent : '');
+      if (ai) { score = ai.score; why = ai.reason; }
+      else log('AI 调用失败，回退本地匹配');
+    }
+    if (score == null) { const r = scoreJob(jobText, title); score = r.score; hits = r.hits; }
+    const threshold = cfg.aiEnabled ? Number(cfg.aiThreshold || 60) : Number(cfg.minScore || 45);
+    if (score < threshold) { log(`跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`); return 'skip'; }
+    log(`匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`);
 
     const btn = await waitFor(() => document.querySelector(SEL.chatBtn), 4000);
     if (!btn) {
