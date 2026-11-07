@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.4
-// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件
+// @version      1.2.5
+// @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @match        https://www.zhipin.com/web/geek/job*
@@ -36,13 +36,43 @@
     ta.remove();
   };
 
-  console.log('[%s] 脚本已加载 v1.2.4 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v1.2.5 (安全增强版)', 'BOSS海投助手');
+
+  /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
+  const RESUME = {
+    titles: ['运维工程师', 'it运维', '桌面运维', '系统运维', '网络运维', '技术支持', '实施工程师', 'ai agent', '智能体', '大模型', '自动化'],
+    skills: {
+      'linux': 5, 'windows': 4, 'windowsserver': 4, '服务器': 4, '机房': 5, 'idc': 5,
+      '网络': 4, '局域网': 4, 'tcp/ip': 3, 'vlan': 3, 'acl': 2, 'dns': 3, 'dhcp': 3,
+      'vpn': 4, 'openvpn': 3, '防火墙': 3, '路由器': 3, '交换机': 3,
+      '桌面': 4, '打印机': 2, '故障': 3, '排查': 3, '处理': 1,
+      'mysql': 3, 'sql': 3, 'python': 3, 'shell': 3, 'docker': 4, '容器': 3,
+      '云平台': 3, '阿里云': 2, 'ubuntu': 2, '麒麟': 3, 'kylin': 2, '域控': 3,
+      '资产': 2, '工单': 2, 'ai': 2, '大模型': 4, '智能体': 4, 'agent': 4, '自动化': 3, '脚本': 2,
+    },
+    baseWeight: 60,
+  };
+
+  function scoreJob(text, title) {
+    const t = (text || '').toLowerCase();
+    const ty = (title || '').toLowerCase();
+    let w = 0;
+    const hits = [];
+    for (const k of Object.keys(RESUME.skills)) {
+      if (t.includes(k)) { w += RESUME.skills[k]; hits.push(k); }
+    }
+    const skillScore = Math.min(100, (w / RESUME.baseWeight) * 100);
+    const titleHit = RESUME.titles.some((k) => ty.includes(k));
+    const score = Math.min(100, Math.round(skillScore * 0.75 + (titleHit ? 25 : 0)));
+    return { score, hits };
+  }
 
   /* ===================== 配置 ===================== */
   const DEFAULTS = {
     include: '',          // 职位名必须包含其一(逗号分隔,留空不限)
     exclude: '外包,销售,实习', // 职位名含其一则跳过
     excludeCompany: '',   // 公司名含其一则跳过
+    minScore: 45,   // 岗位匹配度阈值(低于此分跳过)
     max: 50,              // 本次最多投递数量
     minDelay: 8,          // 每次投递最小间隔(秒)
     maxDelay: 20,         // 每次投递最大间隔(秒)
@@ -60,6 +90,7 @@
     chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat',
     nextPage: '.options-pages a.next, .options-pages .next',
     dialog: '.dialog-container, .greet-boss-dialog',
+    jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text',
   };
 
   /* ===================== 工具函数 ===================== */
@@ -160,6 +191,9 @@
         <div><label>间隔上限(s)</label><input id="bag-maxd" type="number" min="3"></div>
       </div>
       <div class="row">
+        <div><label>最低匹配度</label><input id="bag-minScore" type="number" min="1" max="100"></div>
+      </div>
+      <div class="row">
         <button id="bag-start">开始投递</button>
         <button id="bag-stop">停止</button>
       </div>
@@ -178,6 +212,7 @@
   $('bag-max').value = cfg.max;
   $('bag-min').value = cfg.minDelay;
   $('bag-maxd').value = cfg.maxDelay;
+  $('bag-minScore').value = cfg.minScore;
 
   panel.querySelector('header').onclick = () => {
     const b = $('bag-body');
@@ -209,6 +244,7 @@
     cfg.max = Math.max(1, +$('bag-max').value || DEFAULTS.max);
     cfg.minDelay = Math.max(3, +$('bag-min').value || DEFAULTS.minDelay);
     cfg.maxDelay = Math.max(cfg.minDelay, +$('bag-maxd').value || DEFAULTS.maxDelay);
+    cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
     _gmSet('cfg', cfg);
   }
 
@@ -349,6 +385,20 @@
     await sleep(rand(500, 900));
     card.click(); // 加载详情
     await sleep(rand(800, 1400));
+
+    // 读取岗位描述正文，和简历画像做相似度匹配
+    const jdEl = await waitFor(() => {
+      const el = [...document.querySelectorAll(SEL.jdText)].find(visible);
+      return el && (el.textContent || '').trim().length > 30 ? el : null;
+    }, 4000);
+
+    const jobText = `${title} ${card.textContent || ''} ${jdEl ? jdEl.textContent : ''}`;
+    const { score, hits } = scoreJob(jobText, title);
+    if (score < Number(cfg.minScore || 45)) {
+      log(`跳过(匹配度${score}<${cfg.minScore}):${title} @ ${company}`);
+      return 'skip';
+    }
+    log(`匹配度${score}(命中:${hits.slice(0, 6).join('/') || '无'}):${title} @ ${company}`);
 
     const btn = await waitFor(() => document.querySelector(SEL.chatBtn), 4000);
     if (!btn) {
