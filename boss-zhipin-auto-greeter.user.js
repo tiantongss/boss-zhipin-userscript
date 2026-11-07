@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      2.0.1
+// @version      2.0.2
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止；投递成功后停留在当前页并自动发送简历附件；按岗位名与岗位描述同简历履历的匹配度过滤，仅投递高相似岗位；循环执行"立即沟通→留在此页"直到无推荐岗位或触发风控；支持接入 OpenAI 兼容大模型接口做岗位语义匹配（API Key 仅存本地）；按关键词队列依次搜索，列表滚动到底自动切换下一个关键词，异常时由 AI 从有限动作集中选择处置动作
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -60,7 +60,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v2.0.1 (安全增强版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v2.0.2 (安全增强版)', 'BOSS海投助手');
 
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
@@ -248,7 +248,7 @@
     cardCompany: '.company-name, .boss-name',
     detail: '.job-detail-box, .job-detail',
     detailBox: '#job-detail, .job-detail-box, .job-detail-container, .job-detail, .job-detail-wrap',
-    chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat',
+    chatBtn: '.job-detail-box .btn-startchat, .job-detail-box .op-btn-chat, .job-detail .btn-startchat, [ka*="job-detail-chat"], .job-detail-op .btn, .job-detail-container .btn-startchat, .job-detail-op .btn-startchat',
     nextPage: '.options-pages a.next, .options-pages .next',
     dialog: '.dialog-container, .greet-boss-dialog',
     jdText: '.job-sec-text, .job-detail-section .text, .job-detail .job-sec-text, .job-detail-box .job-sec-text',
@@ -375,6 +375,9 @@
       </div>
       <div class="row">
         <button id="bag-diag" style="background:#00bebd; margin-top:4px;">界面自检(不点也不改页面)</button>
+      </div>
+      <div class="row">
+        <button id="bag-test" style="background:#e8a33d; margin-top:4px;">测试点一次(只点当前岗位)</button>
       </div>
       <div id="bag-count"></div>
       <div id="bag-log"></div>
@@ -781,6 +784,34 @@
     log('===== 界面自检结束 =====');
   }
 
+  // 单点测试：只针对当前右侧详情，点一次「立即沟通」并观察弹窗，用于定位卡点
+  async function testOne() {
+    log('===== 单点测试开始 =====');
+    const btn = findChatBtn(document.querySelector(SEL.card));
+    if (!btn) {
+      log('测试:未找到「立即沟通」按钮，先输出界面结构');
+      runDiag();
+      return;
+    }
+    const bcls = String(btn.className || '').trim().slice(0, 40);
+    log(`测试:找到按钮 <${btn.tagName.toLowerCase()} class="${bcls}">「${(btn.textContent || '').trim()}」`);
+    btn.click();
+    log('测试:已派发点击,等待弹窗…');
+    const stay = await waitFor(() => findStayBtn(), 6000, 200);
+    if (stay) {
+      const scls = String(stay.className || '').trim().slice(0, 40);
+      log(`测试:出现「留在此页」 <${stay.tagName.toLowerCase()} class="${scls}">`);
+      stay.click();
+      await sleep(rand(700, 1100));
+      log(`测试:已点击留在此页,弹窗是否仍在 = ${anyDialog()}`);
+    } else {
+      log('测试:点击后未出现「留在此页」弹窗');
+      log(`测试:页面含"留在此页" = ${/留在此页/.test(document.body.innerText)}`);
+      log(`测试:当前是否有弹窗 = ${anyDialog()}`);
+    }
+    log('===== 单点测试结束 =====');
+  }
+
   // 单个关键词：从第一张卡到最后一张，滚动加载直到无新增
   async function runKeyword(kw) {
     let idx = 0, emptyRounds = 0, failStreak = 0, aiTries = 0;
@@ -901,6 +932,7 @@
     running = false;
   };
   $('bag-diag').onclick = () => runDiag();
+  $('bag-test').onclick = () => testOne();
   $('bag-unlock').onclick = () => {
     const l = _gmGet('bag_lock', null);
     if (!l || l.until <= Date.now()) return log('当前没有处于冷却中');
