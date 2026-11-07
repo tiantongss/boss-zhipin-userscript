@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.2.0
+// @version      3.3.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.2.0 (AI逐岗评估版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.3.0 (AI逐岗评估+挂机模式)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -167,6 +167,35 @@
     }
   }
 
+  /* ===== 挂机模式:拟人行为模拟 ===== */
+  // 每岗间隔:挂机模式用更长更分散的区间(配置在面板,默认30-75s)
+  const actDelayMs = () => cfg.stealth
+    ? rand(cfg.stealthMin, cfg.stealthMax) * 1000
+    : rand(cfg.minDelay, cfg.maxDelay) * 1000;
+
+  // 模拟真人阅读:随机小幅滚动页面与详情区+不规则停顿,偶发合成鼠标挪动(仅挂机模式)
+  async function simulateReading() {
+    if (!cfg.stealth) return;
+    const rounds = 1 + Math.floor(Math.random() * 3); // 1-3 轮
+    for (let i = 0; i < rounds; i++) {
+      await pauseableSleep(rand(700, 2200));
+      const dir = Math.random() < 0.7 ? 1 : -1; // 大部分向下,偶尔回滚
+      const px = Math.round(rand(120, 480)) * dir;
+      try {
+        window.scrollBy({ top: px, behavior: 'smooth' });
+        const box = document.querySelector(SEL.detailBox);
+        if (box) box.scrollTop = Math.max(0, box.scrollTop + px);
+      } catch (e) {}
+      if (Math.random() < 0.5) {
+        try {
+          document.body.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, clientX: Math.round(rand(200, 900)), clientY: Math.round(rand(200, 600)),
+          }));
+        } catch (e) {}
+      }
+    }
+  }
+
   /* ===== 简历画像（来自 朱鑫海 的履历，用于岗位相似度打分）===== */
   const RESUME = {
     titles: ['运维工程师', 'it运维', '桌面运维', '系统运维', '网络运维', '技术支持', '实施工程师', 'ai agent', '智能体', '大模型', '自动化'],
@@ -219,6 +248,9 @@
     max: 50,              // 本次最多投递数量
     minDelay: 8,          // 每次投递最小间隔(秒)
     maxDelay: 20,         // 每次投递最大间隔(秒)
+    stealth: false,       // 挂机模式:低频+拟人行为(长间隔/随机阅读滚动/定时休息),降低风控命中
+    stealthMin: 30,       // 挂机模式每岗间隔下限(秒)
+    stealthMax: 75,       // 挂机模式每岗间隔上限(秒)
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
     aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
@@ -613,7 +645,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.2.0(AI逐岗评估)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.3.0(AI评估+挂机)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -626,6 +658,13 @@
       </div>
       <div class="row">
         <div><label>最低匹配度</label><input id="bag-minScore" type="number" min="1" max="100"></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;color:#333">
+        <input id="bag-stealth" type="checkbox" style="width:auto">挂机模式(低频拟人:长间隔+随机滚动阅读+定时休息,防风控)
+      </label>
+      <div class="row">
+        <div><label>挂机间隔下限(s)</label><input id="bag-stmin" type="number" min="10"></div>
+        <div><label>挂机间隔上限(s)</label><input id="bag-stmax" type="number" min="10"></div>
       </div>
       <label style="display:flex;align-items:center;gap:6px;margin-top:8px;color:#333">
         <input id="bag-aiEnabled" type="checkbox" style="width:auto">启用AI匹配
@@ -668,6 +707,9 @@
   $('bag-max').value = cfg.max;
   $('bag-min').value = cfg.minDelay;
   $('bag-maxd').value = cfg.maxDelay;
+  $('bag-stealth').checked = !!cfg.stealth;
+  $('bag-stmin').value = cfg.stealthMin;
+  $('bag-stmax').value = cfg.stealthMax;
   $('bag-minScore').value = cfg.minScore;
   $('bag-aiEnabled').checked = !!cfg.aiEnabled;
   $('bag-realClick').checked = !!cfg.realClick;
@@ -713,6 +755,9 @@
     cfg.max = Math.max(1, +$('bag-max').value || DEFAULTS.max);
     cfg.minDelay = Math.max(3, +$('bag-min').value || DEFAULTS.minDelay);
     cfg.maxDelay = Math.max(cfg.minDelay, +$('bag-maxd').value || DEFAULTS.maxDelay);
+    cfg.stealth = $('bag-stealth').checked;
+    cfg.stealthMin = Math.max(10, +$('bag-stmin').value || DEFAULTS.stealthMin);
+    cfg.stealthMax = Math.max(cfg.stealthMin, +$('bag-stmax').value || DEFAULTS.stealthMax);
     cfg.minScore = Math.min(100, Math.max(1, +$('bag-minScore').value || DEFAULTS.minScore));
     cfg.aiEnabled = !!$('bag-aiEnabled').checked;
     cfg.realClick = !!$('bag-realClick').checked;
@@ -1320,6 +1365,7 @@
     }
     const jd = opened ? readJd() : '';
     if (!jd) log(`未读到JD，改按标题与卡片标签打分:${title}`);
+    await simulateReading(); // 挂机模式:模拟真人阅读JD(随机滚动+停顿)
 
     const jobText = `${title} ${card.textContent || ''} ${jd}`;
 
@@ -1377,6 +1423,8 @@
 
     // 执行点击 + 验证弹窗（doAction:定位检查→合成点击→验证→系统级兜底→结构化日志）
     // 成功判据:出现「留在此页」按钮,或出现点击前不存在的新浮层
+    // 挂机模式:点击前拟人犹豫(真人点沟通前会停顿确认)
+    if (cfg.stealth) await pauseableSleep(rand(1200, 3200));
     const overlayBefore = anyOverlay();
     const clickRes = await doAction({
       name: '立即沟通',
@@ -1586,6 +1634,7 @@
   // 单个关键词：从第一张卡到最后一张，滚动加载直到无新增
   async function runKeyword(kw) {
     let idx = 0, emptyRounds = 0, dryRounds = 0, failStreak = 0, aiTries = 0;
+    let sinceBreak = 0, breakAt = 8 + Math.floor(Math.random() * 8); // 挂机模式:每8-15岗休息一次
     while (Task.working) {
       await checkpoint();
       _gmSet('bag_hb', Date.now());
@@ -1642,7 +1691,7 @@
       if (st === 'halt') return;
       if (st === 'ok') {
         failStreak = 0;
-        await pauseableSleep(rand(cfg.minDelay, cfg.maxDelay) * 1000);
+        await pauseableSleep(actDelayMs());
       } else if (st === 'fail') {
         if (++failStreak >= cfg.maxFail) {
           const act = await aiDecide('连续失败', { kw, failStreak });
@@ -1650,6 +1699,18 @@
           if (failStreak >= cfg.maxFail + 2) { trip(`连续失败 ${failStreak} 次，触发熔断保护机制`); return; }
         }
         await sleep(rand(2000, 3000));
+      } else if (st === 'skip' && cfg.stealth) {
+        // 挂机模式:跳过也保持拟人翻页节奏(真人浏览每张卡都会停留几秒)
+        await pauseableSleep(rand(4, 10) * 1000);
+      }
+
+      // 挂机模式:每处理 8-15 个岗位休息 2-5 分钟,模拟真人疲劳节奏
+      if (cfg.stealth && ++sinceBreak >= breakAt) {
+        sinceBreak = 0;
+        breakAt = 8 + Math.floor(Math.random() * 8);
+        const rest = Math.round(rand(120, 300));
+        log(`挂机模式:已连续处理一批岗位,休息 ${rest}s 模拟真人`);
+        await pauseableSleep(rest * 1000);
       }
     }
   }
@@ -1679,6 +1740,7 @@
     log(`开始运行：${kws.length} 个关键词，上限 ${cfg.max} 个投递`);
     if (cfg.aiEnabled) log(`评估模式:AI逐岗评估(阈值${cfg.aiThreshold || 60}分,包含/排除预筛不生效,已沟通过自动跳过)`);
     else log(`过滤配置:包含[${cfg.include || '空(不限)'}] 排除[${cfg.exclude || '空'}] 排除公司[${cfg.excludeCompany || '空'}] 最低分[${cfg.minScore}]`);
+    if (cfg.stealth) log(`挂机模式:间隔${cfg.stealthMin}-${cfg.stealthMax}s/岗,每8-15岗休息2-5分钟,含拟人阅读滚动`);
 
     try {
       for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
