@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         BOSS直聘 岗位信息采集助手 (完整增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.4.1
+// @version      1.4.2
 // @description  在职位推荐/搜索页逐个读取岗位详情，采集岗位、薪资、学历经验、福利、公司行业/规模/融资/简介/工商信息、发布人、地点、JD；深度挖掘合同性质、试用期、工作时间、证书要求、核心技能；支持安全熔断、去重、本地保存、导出 CSV/JSON、选择器诊断。
-// @updateURL    https://raw.githubusercontent.com/tiantongss/boss-zhipin-userscript/main/boss-zhipin-job-collector.user.js
-// @downloadURL  https://raw.githubusercontent.com/tiantongss/boss-zhipin-userscript/main/boss-zhipin-job-collector.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-job-collector.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-job-collector.user.js
 // @match        https://*.zhipin.com/*
 // @noframes
 // @grant        GM_getValue
