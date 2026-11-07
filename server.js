@@ -58,7 +58,8 @@ http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const p = String(body.path || '').trim();
       const content = String(body.content == null ? '' : body.content);
-      if (!/^[^<>:"|?*]{1,260}\.(csv|json)$/i.test(p) || p.includes('..')) throw new Error('bad path');
+      // 允许盘符冒号(D:\...),拒绝其余非法字符与路径穿越——之前把带冒号的绝对路径全拒了导致落盘失败
+      if (!/^(?:[a-zA-Z]:[\\/])?[^<>|?*":]{1,250}\.(csv|json)$/i.test(p) || p.includes('..')) throw new Error('bad path');
       const full = path.isAbsolute(p) ? p : path.join(dir, p);
       fs.mkdirSync(path.dirname(full), { recursive: true });
       if (body.append) fs.appendFileSync(full, content, 'utf8');
