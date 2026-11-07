@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.1.0
+// @version      3.1.1
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.1.0 (模块化·可观测版)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.1.1 (模块化·可观测版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -390,8 +390,9 @@
     if (!el) return false;
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
     const r = el.getBoundingClientRect();
+    // 注意:Firefox+Tampermonkey 沙箱中 view:window 会抛 "does not implement interface Window",不传 view
     const opt = {
-      bubbles: true, cancelable: true, view: window, button: 0,
+      bubbles: true, cancelable: true, button: 0,
       clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
     };
     const targets = [el];
@@ -607,7 +608,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.1.0(可观测版)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.1.1(可观测版)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限)</label><input id="bag-include">
@@ -893,9 +894,14 @@
   }
 
   function clickStay(btn) {
-    ['mousedown', 'mouseup', 'click'].forEach((type) =>
-      btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
-    );
+    // Firefox+Tampermonkey 沙箱中 view:window 会抛错,不传 view;构造失败降级原生 click
+    try {
+      ['mousedown', 'mouseup', 'click'].forEach((type) =>
+        btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+      );
+    } catch (e) {
+      try { btn.click(); } catch (e2) {}
+    }
   }
 
   // 按文案找按钮：忽略空白、限制字数、校验可见与尺寸
@@ -1168,7 +1174,7 @@
     const btn = findStayBtn();
     if (btn) {
       lastStayClick = Date.now();
-      setTimeout(() => clickStay(btn), 200);
+      setTimeout(() => { try { clickStay(btn); } catch (e) {} }, 200);
     }
   }).observe(document.body, { childList: true, subtree: true });
 
@@ -1309,8 +1315,9 @@
 
     const jobText = `${title} ${card.textContent || ''} ${jd}`;
 
-    // 硬性排除：命中即跳过（先于任何打分）
-    const hit = HARD_BLOCK.find((k) => (title + company + jd).includes(k));
+    // 硬性排除：命中即跳过（先于任何打分）。只扫职位名+公司名,JD 正文不扫
+    // (JD 里提到"销售"类词汇会把纯运维岗误杀)
+    const hit = HARD_BLOCK.find((k) => (title + company).includes(k));
     if (hit) {
       alog('JOB_SKIPPED', '跳过(硬性排除:' + hit + '):' + title + ' @ ' + company,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: '硬性排除:' + hit });
