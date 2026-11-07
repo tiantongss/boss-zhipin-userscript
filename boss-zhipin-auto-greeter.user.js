@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.3.0
+// @version      3.3.1
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.3.0 (AI逐岗评估+挂机模式)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.3.1 (挂机深度AI分析版)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -341,6 +341,88 @@
     } catch (e) {
       return null;
     }
+  }
+
+  /* ===== 挂机模式专用:深度 AI 评估(岗位职责+公司信息+行业前景) ===== */
+  async function aiDeepEval(title, company, jd, companyInfo) {
+    const key = _gmGet('aiKey', '');
+    if (!key) return null;
+
+    const ck = 'deep|' + title + '|' + company;
+    const cache = _gmGet('ai_cache', {}) || {};
+    const old = cache[ck];
+    if (old && typeof old.s === 'number' && old.t && Date.now() - old.t < AI_CACHE_TTL) {
+      return { score: old.s, reason: old.r || '', fit: old.f !== false, summary: old.e || '' };
+    }
+
+    // 全局限速：两次调用间隔 ≥1000ms
+    const gap = _aiLastAt + 1000 - Date.now();
+    if (gap > 0) await sleep(gap);
+    _aiLastAt = Date.now();
+
+    const prompt = [
+      '你是资深职业规划师兼行业分析师。对下列岗位做深度评估，分两步:',
+      '1)岗位匹配:职责是否在候选人能力范围内(IT运维/系统运维/桌面运维/网络/服务器/IDC/技术支持/AI工程)，任职要求(学历/经验/技能)是否基本满足;',
+      '2)公司与行业:结合公司信息判断其所处行业的前景、业务可持续性，以及这份工作对候选人职业发展的价值。',
+      '评分标准:80-100=高度匹配值得投递;60-79=基本匹配可投递;40-59=部分匹配;0-39=不匹配。fit=是否建议投递。',
+      '【简历】',
+      RESUME_TEXT,
+      '【岗位】' + title + ' @ ' + company,
+      '【公司信息】' + (companyInfo || '未获取到'),
+      '【岗位描述】',
+      (jd || '').slice(0, 1800),
+      '只输出 JSON：{"score":0-100,"fit":true|false,"reason":"30字内","summary":"80字内,岗位匹配度+公司行业前景的综合评估"}',
+    ].join('\n');
+
+    const res = await _gmPost(cfg.aiBase.replace(/\/+$/, '') + '/chat/completions', {
+      model: cfg.aiModel,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: '你是资深职业规划师兼行业分析师，只输出JSON' },
+        { role: 'user', content: prompt },
+      ],
+    }, { Authorization: 'Bearer ' + key });
+    if (!res) return null;
+
+    try {
+      let txt = (((res.choices || [])[0] || {}).message || {}).content || '';
+      txt = String(txt).replace(/```json/gi, '').replace(/```/g, '').trim();
+      const m = txt.match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      const o = JSON.parse(m[0]);
+      const score = Math.min(100, Math.max(0, Math.round(Number(o.score))));
+      if (!isFinite(score)) return null;
+      const reason = String(o.reason || '').replace(/\s+/g, ' ').slice(0, 30);
+      const summary = String(o.summary || '').replace(/\s+/g, ' ').slice(0, 80);
+      const fit = o.fit === false ? false : (o.fit === true ? true : score >= 60);
+
+      const now = Date.now();
+      const next = {};
+      for (const k of Object.keys(cache)) {
+        const v = cache[k];
+        if (v && v.t && now - v.t < AI_CACHE_TTL) next[k] = v;
+      }
+      next[ck] = { s: score, r: reason, f: fit, e: summary, t: now };
+      const cnt = Object.keys(next).length;
+      _gmSet('ai_cache', cnt > 500 ? { [ck]: next[ck] } : next);
+
+      return { score, reason, fit, summary };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 读取详情区的公司信息(行业/规模/融资阶段等),供深度评估使用
+  function readCompanyInfo() {
+    const sels = ['.company-info', '.job-detail-company', '.company-detail', '.detail-company', '[class*="company-info"]'];
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      if (el && el.getClientRects().length) {
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t.length > 10) return t.slice(0, 300);
+      }
+    }
+    return '';
   }
 
   /* ===== AI 异常裁判（异常时从有限动作集中选一个） ===== */
@@ -645,7 +727,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.3.0(AI评估+挂机)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.3.1(挂机深度分析)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -1279,10 +1361,10 @@
     }
     async function exportCsv() {
       const rows = await all();
-      const head = ['岗位', '公司', '薪资', '地区', '匹配度', '状态', '时间', '链接'];
+      const head = ['岗位', '公司', '薪资', '地区', '匹配度', '状态', '评估理由', 'AI综合评估', 'JD摘要', '时间', '链接'];
       const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
       const lines = [head.join(',')].concat(
-        rows.map((j) => [j.title, j.company, j.salary, j.area, j.score, j.status, j.ts, j.url].map(esc).join(','))
+        rows.map((j) => [j.title, j.company, j.salary, j.area, j.score, j.status, j.reason, j.aiEval, (j.jd || '').slice(0, 120), j.ts, j.url].map(esc).join(','))
       );
       const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv' });
       const a = document.createElement('a');
@@ -1318,6 +1400,7 @@
       url: a ? a.href : '',
       score: meta && meta.score != null ? meta.score : null,
       reason: (meta && meta.reason) || '',
+      aiEval: (meta && meta.aiEval) || '',
       status: (meta && meta.status) || 'seen',
       ts: new Date().toISOString(),
     };
@@ -1396,15 +1479,23 @@
     }
 
     // AI 逐岗评估(AI 开启时)或本地规则打分。AI 调用失败回退规则分,阈值也回退本地阈值
-    let score = null, hits = [], why = '', aiUsed = false;
+    // 挂机模式:先把采集到的岗位信息存本地(status=analyzing),再做深度AI分析(含公司/行业前景),分析后才决定投递
+    let score = null, hits = [], why = '', aiUsed = false, aiEvalText = '';
     if (cfg.aiEnabled) {
-      const ai = await aiScore(title, company, jd);
+      let ai = null;
+      if (cfg.stealth) {
+        await JobStore.put(extractJob(card, { status: 'analyzing' }));
+        ai = await aiDeepEval(title, company, jd, readCompanyInfo());
+        if (ai) aiEvalText = ai.summary || '';
+      } else {
+        ai = await aiScore(title, company, jd);
+      }
       if (ai) {
         aiUsed = true; score = ai.score; why = ai.reason;
         if (ai.fit === false) {
           alog('JOB_SKIPPED', `跳过(AI判定不匹配${why ? ':' + why : ''}):${title} @ ${company}`,
             { action_type: 'SKIP', target: title + ' @ ' + company, reason: 'AI不匹配:' + why, score });
-          await JobStore.put(extractJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score }));
+          await JobStore.put(extractJob(card, { status: 'skipped', reason: 'AI不匹配:' + why, score, aiEval: aiEvalText }));
           return 'skip';
         }
       }
@@ -1415,7 +1506,7 @@
     if (score < threshold) {
       alog('JOB_SKIPPED', `跳过(匹配度${score}<${threshold})${why ? ' AI:' + why : ''}:${title} @ ${company}`,
         { action_type: 'SKIP', target: title + ' @ ' + company, reason: `匹配度${score}<${threshold}`, score });
-      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score }));
+      await JobStore.put(extractJob(card, { status: 'skipped', reason: `匹配度${score}<${threshold}`, score, aiEval: aiEvalText }));
       return 'skip';
     }
     alog('JOB_SCORED', `匹配度${score}${why ? '(AI:' + why + ')' : '(命中:' + (hits.slice(0, 6).join('/') || '无') + ')'}:${title} @ ${company}`,
@@ -1455,7 +1546,7 @@
     sent++;
     alog('JOB_SENT', `✔ 已投递(${sent}/${cfg.max}):${title} @ ${company}${resumeSent ? '｜含简历附件' : ''}`,
       { action_type: 'SEND', target: title + ' @ ' + company, result: 'success', score });
-    await JobStore.put(extractJob(card, { status: 'sent', score, reason: why }));
+    await JobStore.put(extractJob(card, { status: 'sent', score, reason: why, aiEval: aiEvalText }));
     return 'ok';
   }
 
@@ -1741,6 +1832,7 @@
     if (cfg.aiEnabled) log(`评估模式:AI逐岗评估(阈值${cfg.aiThreshold || 60}分,包含/排除预筛不生效,已沟通过自动跳过)`);
     else log(`过滤配置:包含[${cfg.include || '空(不限)'}] 排除[${cfg.exclude || '空'}] 排除公司[${cfg.excludeCompany || '空'}] 最低分[${cfg.minScore}]`);
     if (cfg.stealth) log(`挂机模式:间隔${cfg.stealthMin}-${cfg.stealthMax}s/岗,每8-15岗休息2-5分钟,含拟人阅读滚动`);
+    if (cfg.stealth && !cfg.aiEnabled) log('提示:挂机模式未启用AI,按本地规则打分,无深度分析(公司/行业评估)');
 
     try {
       for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
