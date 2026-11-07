@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.2.1
+// @version      1.2.2
 // @description  在职位搜索页自动逐个点击"立即沟通",支持关键词过滤、随机长间隔、安全熔断机制、防风控冷却锁、弹窗自动处理与异常强行停止
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -15,7 +15,28 @@
 
 (function () {
   'use strict';
-  console.log('[%s] 脚本已加载 v1.2.0 (安全增强版)', 'BOSS海投助手');
+  /* ===================== 跨浏览器兼容层（Tampermonkey / Violentmonkey / Greasemonkey 通用） ===================== */
+  const _gmGet = (k, d) => {
+    try { return typeof GM_getValue === 'function' ? GM_getValue(k, d) : (localStorage.getItem('bz_' + k) !== null ? JSON.parse(localStorage.getItem('bz_' + k)) : d); }
+    catch (e) { console.warn('[兼容层] 读取失败', k, e); return d; }
+  };
+  const _gmSet = (k, v) => {
+    try { if (typeof GM_setValue === 'function') GM_setValue(k, v); else localStorage.setItem('bz_' + k, JSON.stringify(v)); }
+    catch (e) { console.warn('[兼容层] 保存失败', k, e); }
+  };
+  const _gmStyle = (css) => {
+    if (typeof GM_addStyle === 'function') { try { return GM_addStyle(css); } catch (e) {} }
+    const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s;
+  };
+  const _gmClip = (text) => {
+    if (typeof GM_setClipboard === 'function') { try { GM_setClipboard(text); return; } catch (e) {} }
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) { console.warn('[兼容层] 复制失败', e); }
+    ta.remove();
+  };
+
+  console.log('[%s] 脚本已加载 v1.2.2 (安全增强版)', 'BOSS海投助手');
 
   /* ===================== 配置 ===================== */
   const DEFAULTS = {
@@ -28,7 +49,7 @@
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
   };
-  const cfg = Object.assign({}, DEFAULTS, GM_getValue('cfg', {}));
+  const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
 
   // 选择器集中放这里,BOSS 改版后只需改这里
   const SEL = {
@@ -71,7 +92,7 @@
   function todayKey() { return new Date().toLocaleDateString(); }
   
   function getLock() {
-    const l = GM_getValue('bag_lock', null);
+    const l = _gmGet('bag_lock', null);
     return l && l.until > Date.now() ? l : null;
   }
 
@@ -97,8 +118,8 @@
 
   function trip(reason, silent) {
     running = false;
-    GM_setValue('bag_hb', 0);
-    GM_setValue('bag_lock', { until: Date.now() + cfg.cooldownMin * 60000, reason, at: Date.now() });
+    _gmSet('bag_hb', 0);
+    _gmSet('bag_lock', { until: Date.now() + cfg.cooldownMin * 60000, reason, at: Date.now() });
     panel.style.borderColor = '#e55';
     log('⛔ 已自动停止:' + reason);
     log(`安全冷却 ${cfg.cooldownMin} 分钟。请先在页面手动完成验证/处理异常，不要立刻重试。`);
@@ -108,7 +129,7 @@
   }
 
   /* ===================== UI 界面 ===================== */
-  GM_addStyle(`
+  _gmStyle(`
     #bag-panel{position:fixed;right:16px;bottom:16px;width:300px;z-index:99999;background:#fff;
       border:1px solid #00bebd;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.18);
       font:12px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#333}
@@ -188,7 +209,7 @@
     cfg.max = Math.max(1, +$('bag-max').value || DEFAULTS.max);
     cfg.minDelay = Math.max(3, +$('bag-min').value || DEFAULTS.minDelay);
     cfg.maxDelay = Math.max(cfg.minDelay, +$('bag-maxd').value || DEFAULTS.maxDelay);
-    GM_setValue('cfg', cfg);
+    _gmSet('cfg', cfg);
   }
 
   /* ===================== 核心逻辑 ===================== */
@@ -343,7 +364,7 @@
     let emptyRounds = 0;
 
     while (running && sent < cfg.max) {
-      GM_setValue('bag_hb', Date.now());
+      _gmSet('bag_hb', Date.now());
       
       const r = detectRisk();
       if (r) {
@@ -365,7 +386,7 @@
       for (const card of cards) {
         if (!running || sent >= cfg.max) break;
         seen.add(card);
-        GM_setValue('bag_hb', Date.now());
+        _gmSet('bag_hb', Date.now());
 
         let st = 'skip';
         try {
@@ -390,7 +411,7 @@
     }
 
     running = false;
-    GM_setValue('bag_hb', 0);
+    _gmSet('bag_hb', 0);
     $('bag-start').disabled = false;
     log(`结束,本次共投递 ${sent} 个`);
   }
@@ -402,10 +423,10 @@
     running = false;
   };
   $('bag-unlock').onclick = () => {
-    const l = GM_getValue('bag_lock', null);
+    const l = _gmGet('bag_lock', null);
     if (!l || l.until <= Date.now()) return log('当前没有处于冷却中');
     if (!confirm(`上次熔断原因:${l.reason}\n请确认已在页面手动完成验证/处理，确定解除冷却吗？`)) return;
-    GM_setValue('bag_lock', null);
+    _gmSet('bag_lock', null);
     panel.style.borderColor = '#00bebd';
     updateStatus();
     log('已手动解除冷却');
