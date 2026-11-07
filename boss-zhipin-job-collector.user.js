@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 岗位信息采集助手 (完整增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      1.4.2
+// @version      1.4.3
 // @description  在职位推荐/搜索页逐个读取岗位详情，采集岗位、薪资、学历经验、福利、公司行业/规模/融资/简介/工商信息、发布人、地点、JD；深度挖掘合同性质、试用期、工作时间、证书要求、核心技能；支持安全熔断、去重、本地保存、导出 CSV/JSON、选择器诊断。
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-job-collector.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-job-collector.user.js
@@ -16,7 +16,28 @@
 
 (function () {
   'use strict';
-  console.log('[%s] 脚本已加载 v1.4.1', 'BOSS采集助手');
+  /* ===================== 跨浏览器兼容层（Tampermonkey / Violentmonkey / Greasemonkey 通用） ===================== */
+  const _gmGet = (k, d) => {
+    try { return typeof GM_getValue === 'function' ? GM_getValue(k, d) : (localStorage.getItem('bz_' + k) !== null ? JSON.parse(localStorage.getItem('bz_' + k)) : d); }
+    catch (e) { console.warn('[兼容层] 读取失败', k, e); return d; }
+  };
+  const _gmSet = (k, v) => {
+    try { if (typeof GM_setValue === 'function') GM_setValue(k, v); else localStorage.setItem('bz_' + k, JSON.stringify(v)); }
+    catch (e) { console.warn('[兼容层] 保存失败', k, e); }
+  };
+  const _gmStyle = (css) => {
+    if (typeof GM_addStyle === 'function') { try { return GM_addStyle(css); } catch (e) {} }
+    const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s;
+  };
+  const _gmClip = (text) => {
+    if (typeof GM_setClipboard === 'function') { try { GM_setClipboard(text); return; } catch (e) {} }
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) { console.warn('[兼容层] 复制失败', e); }
+    ta.remove();
+  };
+
+  console.log('[%s] 脚本已加载 v1.4.3', 'BOSS采集助手');
 
   const VER = 3; // 记录版本。低于此版本的旧记录会在开启刷新时进行补采
 
@@ -34,8 +55,8 @@
     dailyMax: 300,    // 每日累计采集上限
     cooldownMin: 30,  // 熔断后冷却(分钟)
   };
-  const cfg = Object.assign({}, DEFAULTS, GM_getValue('cfg', {}));
-  let store = GM_getValue('jobs', {});
+  const cfg = Object.assign({}, DEFAULTS, _gmGet('cfg', {}));
+  let store = _gmGet('jobs', {});
 
   /* ===================== 选择器配置 ===================== */
   const SEL = {
@@ -233,7 +254,7 @@
   }
 
   /* ===================== UI 界面构建 ===================== */
-  GM_addStyle(`
+  _gmStyle(`
     #bjc-panel{position:fixed;left:16px;bottom:16px;width:310px;z-index:99999;background:#fff;
       border:1px solid #4a7cff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.18);
       font:12px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#333}
@@ -256,7 +277,7 @@
   const panel = document.createElement('div');
   panel.id = 'bjc-panel';
   panel.innerHTML = `
-    <header><span>岗位采集助手 v1.4.1</span><span id="bjc-toggle">收起</span></header>
+    <header><span>岗位采集助手 v1.4.3</span><span id="bjc-toggle">收起</span></header>
     <div id="bjc-body">
       <label>目标岗位(逗号分隔)</label><textarea id="bjc-titles" rows="3"></textarea>
       <label>职位名排除词</label><input id="bjc-exclude">
@@ -333,7 +354,7 @@
     cfg.maxFail = Math.max(1, +$('bjc-maxfail').value || DEFAULTS.maxFail);
     cfg.dailyMax = Math.max(1, +$('bjc-daily').value || DEFAULTS.dailyMax);
     cfg.cooldownMin = Math.max(1, +$('bjc-cool').value || DEFAULTS.cooldownMin);
-    GM_setValue('cfg', cfg);
+    _gmSet('cfg', cfg);
   }
 
   /* ===================== 风控检测与熔断机制 ===================== */
@@ -350,15 +371,15 @@
 
   function todayKey() { return new Date().toLocaleDateString(); }
   function getQuota() {
-    const d = GM_getValue('quota', {});
+    const d = _gmGet('quota', {});
     return d.date === todayKey() ? d.count || 0 : 0;
   }
   function addQuota() {
-    GM_setValue('quota', { date: todayKey(), count: getQuota() + 1 });
+    _gmSet('quota', { date: todayKey(), count: getQuota() + 1 });
     updateCount();
   }
   function getLock() {
-    const l = GM_getValue('lock', null);
+    const l = _gmGet('lock', null);
     return l && l.until > Date.now() ? l : null;
   }
   function visible(el) {
@@ -380,8 +401,8 @@
 
   function trip(reason, silent) {
     running = false;
-    GM_setValue('hb', 0);
-    GM_setValue('lock', { until: Date.now() + cfg.cooldownMin * 60000, reason, at: Date.now() });
+    _gmSet('hb', 0);
+    _gmSet('lock', { until: Date.now() + cfg.cooldownMin * 60000, reason, at: Date.now() });
     panel.style.borderColor = '#e55';
     log('⛔ 已自动停止:' + reason);
     log(`冷却 ${cfg.cooldownMin} 分钟。请先在页面手动完成验证/登录，不要立刻重试。`);
@@ -611,7 +632,7 @@
     }
 
     store[key] = mergeRec(old, rec);
-    GM_setValue('jobs', store);
+    _gmSet('jobs', store);
     addQuota();
     log(`✔ ${rec.岗位} @ ${rec.企业} | ${rec.薪资 || rec.薪资备注 || '无薪资'} | ${rec.学历要求 || '-'} ${rec.经验要求 || '-'}${old ? ' (补采)' : ''}`);
     return 'ok';
@@ -661,7 +682,7 @@
     log(`开始采集,本次目标 ${target} 条(今日剩余额度 ${quotaLeft});连续失败 ${cfg.maxFail} 条将自动停止`);
 
     while (running && got < target) {
-      GM_setValue('hb', Date.now());
+      _gmSet('hb', Date.now());
       const r = detectRisk();
       if (r) { trip(r); break; }
 
@@ -679,7 +700,7 @@
       for (const card of cards) {
         if (!running || got >= target) break;
         seen.add(card);
-        GM_setValue('hb', Date.now());
+        _gmSet('hb', Date.now());
         let st;
         try { st = await collectCard(card); } catch (e) { log('出错:' + e.message); st = 'fail'; }
         if (st === 'halt') break;
@@ -699,7 +720,7 @@
 
     if (running && got >= target && target < cfg.max) log(`已达今日额度上限(${cfg.dailyMax}),停止`);
     running = false;
-    GM_setValue('hb', 0);
+    _gmSet('hb', 0);
     $('bjc-start').disabled = false;
     log(`采集完成,本次新增/补采 ${got} 条`);
   }
@@ -732,7 +753,7 @@
     const d = q(document, SEL.detail);
     let out = '--- CARD ---\n' + outline(card) + '\n--- DETAIL ---\n' + outline(d);
     out = out.slice(0, 15000);
-    GM_setClipboard(out);
+    _gmClip(out);
     log(`已复制页面结构(${out.length}字符)到剪贴板。`);
   }
 
@@ -806,7 +827,7 @@
           upgraded++;
         }
       });
-      GM_setValue('jobs', store);
+      _gmSet('jobs', store);
       updateCount();
       log(`导入完成:新增 ${added} 条,升级 ${upgraded} 条`);
     } catch (err) {
@@ -816,10 +837,10 @@
   };
 
   $('bjc-unlock').onclick = () => {
-    const l = GM_getValue('lock', null);
+    const l = _gmGet('lock', null);
     if (!l || l.until <= Date.now()) return log('当前没有冷却');
     if (!confirm(`上次熔断原因:${l.reason}\n请确认已在页面手动完成验证/登录且页面恢复正常。\n确定解除冷却吗?`)) return;
-    GM_setValue('lock', null);
+    _gmSet('lock', null);
     panel.style.borderColor = '#4a7cff';
     updateCount();
     log('已解除冷却');
@@ -828,7 +849,7 @@
   $('bjc-clear').onclick = () => {
     if (!confirm('确定清空所有已保存的岗位数据吗?')) return;
     store = {};
-    GM_setValue('jobs', store);
+    _gmSet('jobs', store);
     updateCount();
     log('已清空');
   };
@@ -841,12 +862,12 @@
       log(`⛔ 冷却中(原因:${l.reason}),剩余约${Math.ceil((l.until - Date.now()) / 60000)}分钟`);
       return;
     }
-    const hb = GM_getValue('hb', 0);
+    const hb = _gmGet('hb', 0);
     if (hb && Date.now() - hb < 60000) {
       const r = detectRisk();
       if (r) trip('采集过程中页面被刷新或跳转:' + r, true);
       else log('检测到上次采集被中断(页面刷新),已停止,如需继续请手动点开始。');
     }
-    GM_setValue('hb', 0);
+    _gmSet('hb', 0);
   }, 2000);
 })();
