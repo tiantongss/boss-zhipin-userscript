@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.6.0
+// @version      3.7.0
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.6.0 (统一执行面板+反爬策略)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.7.0 (进度记忆+每词配额+轮巡)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -184,6 +184,39 @@
   let runStartedAt = 0;
   const timeUp = () => cfg.maxMin > 0 && Date.now() - runStartedAt > cfg.maxMin * 60000;
 
+  /* ===== 执行进度持久化 =====
+   * 记录关键词队列、当前词下标、每词已投/已跳、总投递数、轮次;
+   * 手动停止后下次启动(关键词队列未变)自动从断点续跑 */
+  const Progress = {
+    data: null,
+    load() { this.data = _gmGet('progress', null); return this.data; },
+    reset(kws) {
+      this.data = { kws: kws.join('|'), idx: 0, perKw: {}, totalSent: 0, round: 1, done: false, started: Date.now(), updated: Date.now() };
+      this.save();
+    },
+    save() {
+      if (!this.data) return;
+      this.data.updated = Date.now();
+      _gmSet('progress', this.data);
+      try { renderProgress(); } catch (e) {}
+    },
+    kw(k) {
+      if (!this.data.perKw[k]) this.data.perKw[k] = { sent: 0, skip: 0 };
+      return this.data.perKw[k];
+    },
+    matches(kws) { return !!(this.data && this.data.kws === kws.join('|') && !this.data.done); },
+  };
+  function renderProgress() {
+    const el = $('bag-progress');
+    if (!el) return;
+    const d = Progress.data;
+    if (!d) { el.textContent = ''; return; }
+    const kws = d.kws.split('|');
+    const cur = kws[d.idx] || '-';
+    const curSent = d.perKw[cur] ? d.perKw[cur].sent : 0;
+    el.textContent = `进度:第${d.idx + 1}/${kws.length}词[${cur}] 本词已投${curSent}${cfg.perKwQuota ? '/' + cfg.perKwQuota : ''} | 总投${d.totalSent} | 第${d.round}轮${d.done ? '(已完成)' : '(未完成)'}`;
+  }
+
   // 模拟真人阅读:随机小幅滚动页面与详情区+不规则停顿,偶发合成鼠标挪动(挂机模式或采集模式强制)
   async function simulateReading(force) {
     if (!cfg.stealth && !force) return;
@@ -267,6 +300,8 @@
     pace: 'normal',       // 反爬策略:slow慢速/normal常规/fast快速/custom自定义(两种模式共用)
     custMin: 15, custMax: 45, custHuman: true, // 自定义策略:间隔区间+拟人轨迹
     maxMin: 0,            // 执行时长上限(分钟,0不限;两种模式共用)
+    perKwQuota: 0,        // 每个关键词投递配额(0不限);达到后自动换下一个关键词
+    loopRounds: false,    // 全部关键词跑完后,继续新一轮关键词循环
     maxFail: 3,           // 连续失败N条即熔断停止
     cooldownMin: 30,      // 熔断后冷却(分钟)
     aiEnabled: false, aiBase: 'https://api.deepseek.com/v1', aiModel: 'deepseek-chat', aiThreshold: 60,
@@ -743,7 +778,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.6.0(反爬策略)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.7.0(进度记忆)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -752,7 +787,11 @@
       <div class="row">
         <div><label>数量上限(0不限)</label><input id="bag-max" type="number" min="0"></div>
         <div><label>时长上限(分钟,0不限)</label><input id="bag-maxmin" type="number" min="0"></div>
+        <div><label>每关键词配额(0不限)</label><input id="bag-perkw" type="number" min="0"></div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;color:#333">
+        <input id="bag-looprounds" type="checkbox" style="width:auto">全部关键词跑完后继续新一轮循环
+      </label>
       <div class="row">
         <div><label>最低匹配度</label><input id="bag-minScore" type="number" min="1" max="100"></div>
       </div>
@@ -810,8 +849,10 @@
       <div class="row">
         <button id="bag-exportlog" style="background:#36c; margin-top:4px;">导出诊断日志</button>
         <button id="bag-exportjobs" style="background:#36c; margin-top:4px;">导出岗位CSV</button>
+        <button id="bag-resetprog" style="background:#888; margin-top:4px;">重置进度</button>
       </div>
       <div id="bag-count"></div>
+      <div id="bag-progress" style="font-size:11px;color:#1a7f37;margin-top:2px"></div>
       <div id="bag-log"></div>
     </div>`;
   document.body.appendChild(panel);
@@ -823,6 +864,8 @@
   $('bag-excomp').value = cfg.excludeCompany;
   $('bag-max').value = cfg.max;
   $('bag-maxmin').value = cfg.maxMin || 0;
+  $('bag-perkw').value = cfg.perKwQuota || 0;
+  $('bag-looprounds').checked = !!cfg.loopRounds;
   $('bag-pace').value = cfg.pace || 'normal';
   $('bag-custmin').value = cfg.custMin;
   $('bag-custmax').value = cfg.custMax;
@@ -876,6 +919,8 @@
     const _mv = $('bag-max').value.trim();
     cfg.max = _mv === '' ? DEFAULTS.max : Math.max(0, +_mv || 0); // 0=不限数量
     cfg.maxMin = Math.max(0, +$('bag-maxmin').value || 0);          // 0=不限时长
+    cfg.perKwQuota = Math.max(0, +$('bag-perkw').value || 0);       // 每关键词配额,0=不限
+    cfg.loopRounds = $('bag-looprounds').checked;                   // 跑完一轮后继续新一轮
     cfg.pace = $('bag-pace').value || 'normal';
     cfg.custMin = Math.max(3, +$('bag-custmin').value || DEFAULTS.custMin);
     cfg.custMax = Math.max(cfg.custMin, +$('bag-custmax').value || DEFAULTS.custMax);
@@ -1809,6 +1854,11 @@
       const r = detectRisk();
       if (r) { trip(r); return; }
       if (cfg.max > 0 && sent >= cfg.max) return;
+      // 每关键词配额:本词已投达到配额即换下一个关键词
+      if (cfg.perKwQuota > 0 && Progress.data && Progress.kw(kw).sent >= cfg.perKwQuota) {
+        log(`「${kw}」已达每词配额 ${cfg.perKwQuota} 份,换下一个关键词`);
+        return;
+      }
 
       let cards = [...document.querySelectorAll(SEL.card)];
       if (!cards.length) {
@@ -1858,12 +1908,16 @@
       if (st === 'halt') return;
       if (st === 'ok') {
         failStreak = 0;
+        // 进度:本词已投+1,总投+1,立即持久化(手动停止后下次可续跑)
+        if (Progress.data) { const p = Progress.kw(kw); p.sent++; Progress.data.totalSent++; Progress.save(); }
       } else if (st === 'fail') {
         if (++failStreak >= cfg.maxFail) {
           const act = await aiDecide('连续失败', { kw, failStreak });
           if (act && !(await applyAiAction(act))) return;
           if (failStreak >= cfg.maxFail + 2) { trip(`连续失败 ${failStreak} 次，触发熔断保护机制`); return; }
         }
+      } else if (st === 'skip' && Progress.data) {
+        Progress.kw(kw).skip++;
       }
       // 统一节奏:无论投递/跳过/失败,都按反爬策略间隔进入下一岗(速率一致,无信息不对称)
       await pauseableSleep(actDelayMs());
@@ -1892,6 +1946,10 @@
     const kws = String(cfg.keywords || '').split(/\r?\n|,|，/).map((s) => s.trim()).filter(Boolean);
     if (!kws.length) { log('请先填写职位关键词'); return; }
 
+    // 进度恢复:关键词队列与上次一致且未跑完则断点续跑,否则开新进度
+    Progress.load();
+    if (!Progress.matches(kws)) Progress.reset(kws);
+
     Logger.newTask({ keywords: kws, max: cfg.max, aiEnabled: cfg.aiEnabled, include: cfg.include, exclude: cfg.exclude, excludeCompany: cfg.excludeCompany, minScore: cfg.minScore });
     const pg = detectPage();
     alog('PAGE_DETECTED', `页面类型:${pg.type}${pg.detail ? '(' + pg.detail + ')' : ''}`, { page: pg });
@@ -1911,6 +1969,9 @@
       log(`反爬策略:${names[cfg.pace] || '常规随机'}(${p.min}-${p.max}s/岗${p.human ? ',拟人轨迹+定时休息' : ',无拟人动作'}),数量上限${cfg.max || '不限'},时长上限${cfg.maxMin ? cfg.maxMin + '分钟' : '不限'}`);
     }
     if (cfg.stealth && !cfg.aiEnabled) log('提示:挂机模式未启用AI,按本地规则打分,无深度分析(公司/行业评估)');
+    if (Progress.data.totalSent > 0 || Progress.data.idx > 0) {
+      log(`恢复上次进度:第 ${Progress.data.idx + 1}/${kws.length} 词,总已投 ${Progress.data.totalSent} 份(未完成;点「重置进度」可清零重跑)`);
+    }
     // 投递时同步采集:启动即创建表格,与投递同频逐条写入
     syncCtx = null;
     if (cfg.collectSync) {
@@ -1920,28 +1981,53 @@
     }
 
     try {
-      for (let i = 0; i < kws.length && Task.working && sent < cfg.max; i++) {
-        await checkpoint();
-        const kw = kws[i];
-        log(`=== (${i + 1}/${kws.length}) 搜索「${kw}」 ===`);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-        await sleep(rand(600, 1000));
-
-        let okSearch = await doSearch(kw);
-        if (!okSearch) {
-          const act = await aiDecide('找不到搜索框', { kw });
-          if (act === 'abort') break;
-          if (act === 'close_dialog') await closeDialog();
-          if (act === 'scroll_top') window.scrollTo({ top: 0, behavior: 'smooth' });
-          await sleep(rand(1500, 2500));
-          okSearch = await doSearch(kw);
-          if (!okSearch) { log('搜索失败，程序停止'); break; }
+      let roundStart = Progress.data.idx; // 断点续跑:从上次停在的关键词继续
+      while (Task.working) {
+        // 每词配额全部达标则结束,避免轮空循环
+        if (cfg.perKwQuota > 0 && kws.every((k) => Progress.kw(k).sent >= cfg.perKwQuota)) {
+          log(`所有关键词均已达每词配额 ${cfg.perKwQuota} 份,结束`);
+          break;
         }
+        for (let i = roundStart; i < kws.length && Task.working; i++) {
+          await checkpoint();
+          if (timeUp()) { log(`已达执行时长上限(${cfg.maxMin}分钟),结束`); break; }
+          if (cfg.max > 0 && sent >= cfg.max) { log(`已达数量上限(${cfg.max}),结束`); break; }
+          const kw = kws[i];
+          Progress.data.idx = i; Progress.save();
+          if (cfg.perKwQuota > 0 && Progress.kw(kw).sent >= cfg.perKwQuota) {
+            log(`=== (${i + 1}/${kws.length})「${kw}」已达配额 ${cfg.perKwQuota} 份,跳过 ===`);
+            continue;
+          }
+          log(`=== (${i + 1}/${kws.length}) 搜索「${kw}」(本词已投 ${Progress.kw(kw).sent}${cfg.perKwQuota ? '/' + cfg.perKwQuota : ''}) ===`);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          await sleep(rand(600, 1000));
 
-        await runKeyword(kw);
+          let okSearch = await doSearch(kw);
+          if (!okSearch) {
+            const act = await aiDecide('找不到搜索框', { kw });
+            if (act === 'abort') break;
+            if (act === 'close_dialog') await closeDialog();
+            if (act === 'scroll_top') window.scrollTo({ top: 0, behavior: 'smooth' });
+            await sleep(rand(1500, 2500));
+            okSearch = await doSearch(kw);
+            if (!okSearch) { log('搜索失败，程序停止'); break; }
+          }
+
+          await runKeyword(kw);
+          if (!Task.working) break;
+          log(`「${kw}」处理完成，本词已投 ${Progress.kw(kw).sent} 份，累计投递 ${sent} 个`);
+        }
         if (!Task.working) break;
-        log(`「${kw}」处理完成，累计投递 ${sent} 个`);
+        if (timeUp()) break;
+        if (cfg.max > 0 && sent >= cfg.max) break;
+        // 一轮跑完:轮次+1,判断是否开启新一轮循环
+        Progress.data.round++; Progress.data.idx = 0; Progress.save();
+        if (!cfg.loopRounds) { log('所有关键词已跑完一轮'); break; }
+        log(`第 ${Progress.data.round} 轮关键词循环开始(此前已投 ${Progress.data.totalSent} 份)`);
+        roundStart = 0;
       }
+      // 正常跑完(非手动停止/熔断)标记进度完成,下次启动开新进度
+      if (Task.working) { Progress.data.done = true; Progress.save(); }
       if (Task.working) Task.set('COMPLETED', `投递${sent}个`);
     } catch (e) {
       if (e && e.name === 'StopError') {
@@ -2093,6 +2179,13 @@
     Task.set('STOPPED', '手动停止');
   };
   $('bag-diag').onclick = () => runDiag();
+  $('bag-resetprog').onclick = () => {
+    const kws = String(cfg.keywords || '').split(/\r?\n|,|，/).map((s) => s.trim()).filter(Boolean);
+    Progress.reset(kws);
+    log('进度已重置,下次启动从头开始');
+  };
+  Progress.load();
+  renderProgress();
   $('bag-test').onclick = () => testLoop();
   $('bag-exportlog').onclick = () => {
     const n = Logger.exportFile();
