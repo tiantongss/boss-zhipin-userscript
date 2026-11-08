@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 自动打招呼(海投助手安全增强版)
 // @namespace    https://github.com/tiantongss/boss-zhipin-userscript
-// @version      3.7.0
+// @version      3.7.1
 // @description  模块化架构:任务状态机+页面识别+分级定位+执行/验证分离+统一action诊断日志+IndexedDB岗位库。逐个点击"立即沟通",关键词过滤、随机间隔、熔断冷却、弹窗自动处理;按简历匹配度过滤,AI语义打分;关键词队列循环搜索;合成点击无效时升级系统级真实点击(需本地服务)
 // @updateURL    https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/tiantongss/boss-zhipin-userscript@main/boss-zhipin-auto-greeter.user.js
@@ -54,7 +54,7 @@
     }
   });
 
-  console.log('[%s] 脚本已加载 v3.7.0 (进度记忆+每词配额+轮巡)', 'BOSS海投助手');
+  console.log('[%s] 脚本已加载 v3.7.1 (总量均分+停止入日志)', 'BOSS海投助手');
   // 探测本地点击服务是否在线（系统级真实点击依赖它）
   _gmPost('http://127.0.0.1:8901/ping', {}, {}).then((r) =>
     console.log('[BOSS海投助手] 本地点击服务:%s', r && r.ok ? '在线(系统级点击可用)' : '离线(仅合成点击)')
@@ -778,7 +778,7 @@
   const panel = document.createElement('div');
   panel.id = 'bag-panel';
   panel.innerHTML = `
-    <header><span>海投助手 v3.7.0(进度记忆)</span><span id="bag-toggle">收起</span></header>
+    <header><span>海投助手 v3.7.1(进度记忆)</span><span id="bag-toggle">收起</span></header>
     <div id="bag-body">
       <label>职位关键词(每行一个，按顺序搜索)</label><textarea id="bag-keywords" rows="3"></textarea>
       <label>职位名包含(逗号分隔,留空不限;AI模式下不生效)</label><input id="bag-include">
@@ -1949,6 +1949,11 @@
     // 进度恢复:关键词队列与上次一致且未跑完则断点续跑,否则开新进度
     Progress.load();
     if (!Progress.matches(kws)) Progress.reset(kws);
+    // 总量>0且未设每词配额时,自动把总量平均分配到每个关键词(如 999/35≈29 份/词)
+    if (cfg.max > 0 && !cfg.perKwQuota) {
+      cfg.perKwQuota = Math.max(1, Math.ceil(cfg.max / kws.length));
+      log(`总量 ${cfg.max} 份按 ${kws.length} 个关键词平均分配:每词 ${cfg.perKwQuota} 份(面板填「每关键词配额」可改为固定值)`);
+    }
 
     Logger.newTask({ keywords: kws, max: cfg.max, aiEnabled: cfg.aiEnabled, include: cfg.include, exclude: cfg.exclude, excludeCompany: cfg.excludeCompany, minScore: cfg.minScore });
     const pg = detectPage();
@@ -2031,8 +2036,10 @@
       if (Task.working) Task.set('COMPLETED', `投递${sent}个`);
     } catch (e) {
       if (e && e.name === 'StopError') {
-        log('已停止');
+        // 手动停止记入结构化日志(导出JSON可查),进度已逐条落盘,下次自动续跑
+        alog('TASK_STOPPED', `已停止(手动):第${Progress.data ? Progress.data.idx + 1 : '-'}词,本次投递${sent}个`, { sent, kwIdx: Progress.data && Progress.data.idx });
       } else {
+        alog('TASK_ERROR', '任务异常:' + e.message, { error: String(e && e.stack || e), sent });
         log('任务异常:' + e.message);
         Task.set('FAILED', e.message);
       }
@@ -2151,8 +2158,8 @@
       }
       if (Task.working) Task.set('COMPLETED', '采集完成');
     } catch (e) {
-      if (e && e.name === 'StopError') log('已停止');
-      else { Task.set('FAILED', e.message); log('采集异常:' + e.message); }
+      if (e && e.name === 'StopError') alog('TASK_STOPPED', '已停止(手动),采集表格数据已逐条落盘', {});
+      else { alog('TASK_ERROR', '采集异常:' + e.message, { error: String(e && e.stack || e) }); Task.set('FAILED', e.message); log('采集异常:' + e.message); }
     }
 
     Logger.endTask(Task.state, {});
